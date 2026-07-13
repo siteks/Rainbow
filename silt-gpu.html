@@ -552,7 +552,7 @@ function frame(now) {
       const rampDown = Math.min(1, pour.remaining / (GRAINS_PER_BLOB * 0.25));
       const rate = Math.max(0.05, Math.min(rampUp, rampDown));
       const n = Math.min(Math.max(5, Math.floor(SPAWN_PER_FRAME * rate)), pour.remaining);
-      const halfW = Math.max(1, Math.round(20 * rate));   // spout width rides the flow rate
+      const halfW = Math.max(1, Math.round(10 * rate));   // spout width rides the flow rate
       device.queue.writeBuffer(spawnUni, 0, new Uint32Array([SIMW, SIMH, pour.x, pour.color + 1, n, (Math.random() * 0xffffffff) >>> 0, halfW, 0]));
       const sp = enc.beginComputePass();
       sp.setPipeline(spawnPipe);
