@@ -62,7 +62,7 @@ const PRAISE = ['Well done!', 'Brilliant!', 'Splendid!', 'Nice one!', 'Superb!',
 const STONE = 6;
 const GRAINS_PER_BLOB = 12000;
 const SPAWN_PER_FRAME = 380;
-const STEPS_PER_FRAME = 8;
+const STEPS_PER_FRAME = 12;
 
 const uiCanvas = document.getElementById('ui');
 const uiCtx = uiCanvas.getContext('2d');
@@ -90,13 +90,16 @@ fn isSand(v: u32) -> bool { return v >= 1u && v <= 5u; }
 `;
 
 const WGSL_STEP = WGSL_COMMON + /* wgsl */`
-struct Params { w: u32, h: u32, offset: u32, seed: u32, pidx: u32, p0: u32, p1: u32, p2: u32 };
+struct Params { w: u32, h: u32, offset: u32, seed: u32, pidx: u32, npass: u32, gtick: u32, p2: u32 };
 @group(0) @binding(0) var<storage, read_write> cells : array<u32>;
 @group(0) @binding(1) var<uniform> P : Params;
 
-fn colorOf(v: u32) -> u32 { return v & 0xffu; }
+// cell word: color bits 0-7, velocity bits 8-11, gravity-tick flag bit 12
 fn velOf(v: u32) -> u32 { return (v >> 8u) & 0xfu; }
-fn withVel(v: u32, nv: u32) -> u32 { return (v & 0xffu) | (nv << 8u); }
+fn withVel(v: u32, nv: u32) -> u32 { return (v & 0xfffff0ffu) | (nv << 8u); }
+fn ticked(v: u32) -> bool { return (v & 0x1000u) != 0u; }
+fn tick(v: u32) -> u32 { return v | 0x1000u; }
+fn untick(v: u32) -> u32 { return v & 0xffffefffu; }
 fn sandC(v: u32) -> bool { let c = v & 0xffu; return c >= 1u && c <= 5u; }
 
 @compute @workgroup_size(8, 8)
@@ -111,33 +114,39 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   var a = cells[iA]; var b = cells[iB];
   var c = cells[iC]; var d = cells[iD];
 
-  // gravity: accelerate/decay once per frame (pass 0), move if vel > pass index
-  if (sandC(a)) {
+  // gravity tick: the first time this frame a grain appears in a block's top
+  // row it gets its acceleration (free fall) or decay (blocked) for the frame
+  let mayTick = P.pidx + 2u < P.npass;   // no ticking after flags are cleared
+  if (mayTick && sandC(a) && !ticked(a)) {
     var va = velOf(a);
-    if (c == 0u) {
-      if (P.pidx == 0u) { va = min(va + 1u, 8u); }      // free fall: accelerate
-      if (va > P.pidx) { c = withVel(a, va); a = 0u; }
-      else { a = withVel(a, va); }
-    } else if (P.pidx == 0u) {
-      a = withVel(a, va - min(va, 2u));                  // blocked: decay toward rest
-    }
+    if (c == 0u) { va = min(va + P.gtick, 12u); } else { va = va - min(va, 2u); }
+    a = tick(withVel(a, va));
   }
-  if (sandC(b)) {
+  if (mayTick && sandC(b) && !ticked(b)) {
     var vb = velOf(b);
-    if (d == 0u) {
-      if (P.pidx == 0u) { vb = min(vb + 1u, 8u); }
-      if (vb > P.pidx) { d = withVel(b, vb); b = 0u; }
-      else { b = withVel(b, vb); }
-    } else if (P.pidx == 0u) {
-      b = withVel(b, vb - min(vb, 2u));
-    }
+    if (d == 0u) { vb = min(vb + P.gtick, 12u); } else { vb = vb - min(vb, 2u); }
+    b = tick(withVel(b, vb));
+  }
+  // grounding: the bottom row never appears as a top cell, so handle it here
+  if (by + 2u == P.h) {
+    if (mayTick && sandC(c) && !ticked(c)) { c = tick(withVel(c, 0u)); }
+    if (mayTick && sandC(d) && !ticked(d)) { d = tick(withVel(d, 0u)); }
   }
 
-  // stochastic topple, resting grains only (vel <= 1), every pass -> fast settling
+  // movement, gated by velocity vs pass index: vel v moves in v of npass passes
+  if (sandC(a) && c == 0u && velOf(a) > P.pidx) { c = a; a = 0u; }
+  if (sandC(b) && d == 0u && velOf(b) > P.pidx) { d = b; b = 0u; }
+
+  // stochastic topple for resting grains -> irregular slopes, fast avalanches
   let r = pcg((iA ^ P.seed) + (P.pidx * 747796405u));
   if ((r & 7u) < 7u) {
     if (sandC(a) && velOf(a) <= 1u && c != 0u && d == 0u && b == 0u) { d = withVel(a, 0u); a = 0u; }
     else if (sandC(b) && velOf(b) <= 1u && d != 0u && c == 0u && a == 0u) { c = withVel(b, 0u); b = 0u; }
+  }
+
+  // clear flags on the frame's final offset-0 pass: offset 0 covers all cells
+  if (P.pidx + 2u == P.npass) {
+    a = untick(a); b = untick(b); c = untick(c); d = untick(d);
   }
   cells[iA] = a; cells[iB] = b; cells[iC] = c; cells[iD] = d;
 }
@@ -539,7 +548,7 @@ function frame(now) {
 
     if (phase === 'idle' || phase === 'pour' || phase === 'settle' || phase === 'judge') {
       for (let s = 0; s < STEPS_PER_FRAME; s++) {
-        device.queue.writeBuffer(stepUnis[s], 0, new Uint32Array([SIMW, SIMH, s & 1, (Math.random() * 0xffffffff) >>> 0, s, 0, 0, 0]));
+        device.queue.writeBuffer(stepUnis[s], 0, new Uint32Array([SIMW, SIMH, s & 1, (Math.random() * 0xffffffff) >>> 0, s, STEPS_PER_FRAME, frameCount & 1, 0]));
         const cp = enc.beginComputePass();
         cp.setPipeline(stepPipe);
         cp.setBindGroup(0, stepBGs[s]);
