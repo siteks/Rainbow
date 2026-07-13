@@ -70,7 +70,7 @@
   const SIMW = 84;   // field ~1.7 blob-widths wide: two same-color pours can bridge
   let SIMH = 140;
   let W, H, px, simX, simY, simPixW, simPixH, trayY;
-  let grid, fade, img, off, offCtx;
+  let grid, vel, fade, img, off, offCtx;
 
   function resize() {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -83,6 +83,7 @@
     simPixW = W; simPixH = SIMH * px;
     trayY = simY - Math.min(64, H * 0.09);
     grid = new Uint8Array(SIMW * SIMH);
+    vel  = new Uint8Array(SIMW * SIMH);   // per-grain fall speed (cells/step)
     fade = new Float32Array(SIMW * SIMH);
     off = document.createElement('canvas');
     off.width = SIMW; off.height = SIMH;
@@ -180,31 +181,69 @@
     }
   }
 
-  // --- sand physics: one pass, bottom-up, alternating sweep ---
+  // --- sand physics: per-grain velocity, multi-cell falls, impact scatter,
+  //     stochastic repose (irregular, rounded piles instead of grid-perfect 45deg) ---
+  const VMAX = 6;
   function stepSand() {
     let moved = 0;
     for (let y = SIMH - 2; y >= 0; y--) {
-      const rowBase = y * SIMW, below = rowBase + SIMW;
-      if (sweepRight) {
-        for (let x = 0; x < SIMW; x++) moved += moveGrain(x, rowBase, below);
-      } else {
-        for (let x = SIMW - 1; x >= 0; x--) moved += moveGrain(x, rowBase, below);
+      for (let ii = 0; ii < SIMW; ii++) {
+        const x = sweepRight ? ii : SIMW - 1 - ii;
+        const i = y * SIMW + x;
+        const c = grid[i];
+        if (c === EMPTY || c === STONE) continue;
+        const sp = Math.min(VMAX, vel[i] + 1);   // gravity
+        // fall up to sp cells straight down
+        let ny = y;
+        while (ny - y < sp && ny < SIMH - 1 && grid[(ny + 1) * SIMW + x] === EMPTY) ny++;
+        if (ny > y) {
+          const j = ny * SIMW + x;
+          grid[j] = c; grid[i] = EMPTY;
+          moved++;
+          if (ny - y === sp) { vel[j] = sp; continue; }   // still in free fall
+          // landed partway through the fall: impact with speed sp
+          vel[j] = 0;
+          if (sp >= 3) scatter(x, ny, c, sp); else slip(x, ny, c);
+          continue;
+        }
+        // was already resting
+        vel[i] = 0;
+        moved += slip(x, y, c);
       }
     }
     sweepRight = !sweepRight;
     return moved;
   }
 
-  function moveGrain(x, rowBase, below) {
-    const v = grid[rowBase + x];
-    if (v === EMPTY || v === STONE) return 0;
-    if (grid[below + x] === EMPTY) { grid[below + x] = v; grid[rowBase + x] = EMPTY; return 1; }
-    const dir = (Math.random() < 0.5) ? 1 : -1;
+  // impact scatter: fast grains hop 1-2 cells sideways on landing
+  function scatter(x, y, c, sp) {
+    const dir = Math.random() < 0.5 ? 1 : -1;
+    const reach = sp >= 5 ? 2 : 1;
+    for (const d of [dir * reach, -dir * reach, dir, -dir]) {
+      const nx = x + d;
+      if (nx < 0 || nx >= SIMW) continue;
+      const j = y * SIMW + nx;
+      if (grid[j] === EMPTY && (y === SIMH - 1 || grid[j + SIMW] === EMPTY || Math.random() < 0.4)) {
+        grid[j] = c; grid[y * SIMW + x] = EMPTY;
+        vel[j] = 1;
+        return;
+      }
+    }
+  }
+
+  // stochastic repose: probabilistic diagonal slip -> irregular slope angles
+  function slip(x, y, c) {
+    if (y >= SIMH - 1) return 0;
+    if (Math.random() > 0.72) return 0;          // sometimes grains just hold
+    const rowBase = y * SIMW, below = rowBase + SIMW;
+    const dir = Math.random() < 0.5 ? 1 : -1;
     for (const d of [dir, -dir]) {
       const nx = x + d;
       if (nx < 0 || nx >= SIMW) continue;
       if (grid[rowBase + nx] === EMPTY && grid[below + nx] === EMPTY) {
-        grid[below + nx] = v; grid[rowBase + x] = EMPTY; return 1;
+        grid[below + nx] = c; grid[rowBase + x] = EMPTY;
+        vel[below + nx] = 1;
+        return 1;
       }
     }
     return 0;
@@ -402,7 +441,7 @@
           const jx = pour.x + Math.floor((Math.random() - 0.5) * 9);  // 9-column spawn spread
           const gx = Math.max(0, Math.min(SIMW - 1, jx));
           const gy = Math.floor(Math.random() * 2);                   // top 2 rows only
-          if (grid[idx(gx, gy)] === EMPTY) { grid[idx(gx, gy)] = pour.color + 1; pour.remaining--; spawned++; }
+          if (grid[idx(gx, gy)] === EMPTY) { const gi = idx(gx, gy); grid[gi] = pour.color + 1; vel[gi] = 2 + Math.floor(Math.random() * 2); pour.remaining--; spawned++; }
         }
         pour.stall = spawned === 0 ? (pour.stall || 0) + 1 : 0;
         // abort if the spawn zone is buried (sand near the top): deliver no more, let it settle
@@ -411,8 +450,7 @@
 
       // physics runs in every active phase
       if (phase === 'idle' || phase === 'pour' || phase === 'settle') {
-        stepSand();
-        stepSand();   // 2 substeps per frame for livelier sand
+        stepSand();   // velocity model: grains fall up to 6 cells/frame
         // bridges clear the moment they form, even mid-pour
         if (frameCount % 12 === 0) checkClears();
         if (phase === 'settle') {
