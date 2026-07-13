@@ -86,7 +86,7 @@ const GRAV = 32.0;
 const E_YOUNG = 4800.0, NU = 0.3;
 const MU = E_YOUNG / (2 * (1 + NU));
 const LAMBDA = E_YOUNG * NU / ((1 + NU) * (1 - 2 * NU));
-const ETA_VISC = 0.02;
+const ETA_VISC = 0.0;    // explicit viscosity destabilizes deep fills; stiffness carries anti-wobble
 const C_DAMP = 0.0;            // set after rig sweep
 const FP = 1048576.0;          // fixed-point scale for grid atomics
 const PSTRIDE = 16;            // px,py,vx,vy,C(4),F(4),q,pad(3)
@@ -164,7 +164,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   // Kirchhoff stress from Hencky strain in the principal frame
   var U : mat2x2<f32>; var sig : vec2<f32>; var V : mat2x2<f32>;
   svd2(F, &U, &sig, &V);
-  let eps = log(clamp(sig, vec2<f32>(0.05), vec2<f32>(4.0)));
+  let eps = log(clamp(sig, vec2<f32>(0.75), vec2<f32>(1.35)));
   let tre = eps.x + eps.y;
   let tp = 2.0 * S.b.x * eps + vec2<f32>(S.b.y * tre);
   var tau = U * mat2x2<f32>(vec2<f32>(tp.x, 0.0), vec2<f32>(0.0, tp.y)) * transpose(U);
@@ -231,8 +231,6 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (gy > n - 4u && v.y > 0.0) { v.y = 0.0; }
     // mild dissipation (inelastic grain collisions, not captured by MPM)
     v *= 0.995;
-    // quasi-static arrest, dense nodes only: loose material creeps until packed
-    if (dot(v, v) < 2.5e-6 && m > 0.85 * S.e.x) { v = vec2<f32>(0.0); }
     // CFL safety clamp
     let vmax = 0.45 * S.a.z / S.a.x;
     let sp = length(v);
@@ -279,8 +277,15 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
       B += mat2x2<f32>(w * gv * dpos.x, w * gv * dpos.y);
     }
   }
-  P[pb + 14u] = rho;   // local density for next substep's stress gate
-  let C = mat2x2<f32>(4.0 * S.a.y * B[0], 4.0 * S.a.y * B[1]);
+  // temporally smoothed density: constitutive response (friction fade,
+  // compression cap) must follow slow physics, not per-substep noise --
+  // an instantaneous-density-dependent cap is a self-excitation engine
+  let rhoF = mix(P[pb + 14u], rho, 0.05);
+  P[pb + 14u] = rhoF;
+  var C = mat2x2<f32>(4.0 * S.a.y * B[0], 4.0 * S.a.y * B[1]);
+  // limiter: bound the velocity gradient so dt*C stays a small strain increment
+  let cn = sqrt(dot(C[0], C[0]) + dot(C[1], C[1]));
+  if (cn > 120.0) { let cs = 120.0 / cn; C = mat2x2<f32>(C[0] * cs, C[1] * cs); }
   x += S.a.x * nv;
   let lo = 2.5 * S.a.z;
   x = clamp(x, vec2<f32>(lo), vec2<f32>(1.0 - lo));
@@ -295,16 +300,19 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   // gravity instead of ratcheting to ever-lower density
   var q = P[pb + 12u];
   var vc = P[pb + 13u];
-  let epsRaw = log(clamp(sig, vec2<f32>(0.05), vec2<f32>(4.0)));
+  let epsRaw = log(clamp(sig, vec2<f32>(0.75), vec2<f32>(1.35)));
   var eps = epsRaw + vec2<f32>(vc * 0.5);
   let tre = eps.x + eps.y;
   let ehat = eps - vec2<f32>(tre * 0.5);
   let en = length(ehat);
   // loose packings cannot sustain shear: friction fades below rest density,
   // so fluffed sand slumps into its voids and re-earns friction as it repacks
-  let rel = rho / S.e.x;
-  let loose = clamp((rel - 0.50) / 0.42, 0.05, 1.0);
-  let alphaEff = S.b.z * (1.0 + 1.6 * min(q, 0.35)) * loose;
+  let rel = rhoF / S.e.x;
+  var loose = clamp((rel - 0.50) / 0.42, 0.05, 1.0);
+  if ((u32(S.e.w) & 2u) != 0u) { loose = 1.0; }
+  var hardq = 1.0 + 0.8 * min(q, 0.20);   // gain cut: hardening fronts need >1 loop gain to propagate
+  if ((u32(S.e.w) & 8u) != 0u) { hardq = 1.0; }
+  let alphaEff = S.b.z * hardq * loose;
   if (tre > 0.0 || en < 1e-9) {
     eps = vec2<f32>(0.0);          // Case II: stress-free, all volume owed
     vc = tre;
@@ -322,7 +330,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   // compression cap (critical-state flavor): loose sand cannot store elastic
   // volumetric strain -- compression beyond the cap is plastic compaction,
   // so under-dense packings sink until they approach rest density
-  let allowedVol = -mix(0.006, 0.08, clamp((rel - 0.55) / 0.40, 0.0, 1.0));
+  var allowedVol = -mix(0.006, 0.08, clamp((rel - 0.55) / 0.40, 0.0, 1.0));
+  if ((u32(S.e.w) & 4u) != 0u) { allowedVol = -9.0; }
   let treNow = eps.x + eps.y;
   if (treNow < allowedVol) {
     let ex = treNow - allowedVol;
@@ -477,6 +486,7 @@ function makeParticles(gen) {
     const b = i * PSTRIDE;
     data[b] = x; data[b + 1] = y;
     data[b + 8] = 1; data[b + 11] = 1;    // F = identity
+    data[b + 14] = (1 / NG / 0.0042) ** 2; // density filter starts at rest
   }
   device.queue.writeBuffer(pBuf, 0, data);
 }
@@ -511,6 +521,7 @@ function pourAt(x, dt) {
     data[b + 1] = 0.90 + Math.random() * 0.06;
     data[b + 3] = -0.4;
     data[b + 8] = 1; data[b + 11] = 1;
+    data[b + 14] = (1 / NG / 0.0042) ** 2;
   }
   device.queue.writeBuffer(pBuf, count * PSTRIDE * 4, data);
   count += n;

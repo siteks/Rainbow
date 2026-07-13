@@ -47,6 +47,7 @@ p2g_p = device.create_compute_pipeline(layout="auto", compute={"module": mods["W
 grid_p = device.create_compute_pipeline(layout="auto", compute={"module": mods["WGSL_GRID"], "entry_point": "main"})
 g2p_p = device.create_compute_pipeline(layout="auto", compute={"module": mods["WGSL_G2P"], "entry_point": "main"})
 
+RHO_REST0 = (1/NG/0.006)**2
 def alpha_from_phi(deg):
     s = math.sin(math.radians(deg))
     return math.sqrt(2/3) * 2 * s / (3 - s)
@@ -65,7 +66,7 @@ def run_collapse(phi_deg, frames=250):
     N = len(pts)
     pdata = array.array("f", [0.0]*(N*PS))
     for i,(x,yy) in enumerate(pts):
-        b = i*PS; pdata[b]=x; pdata[b+1]=yy; pdata[b+8]=1.0; pdata[b+11]=1.0
+        b = i*PS; pdata[b]=x; pdata[b+1]=yy; pdata[b+8]=1.0; pdata[b+11]=1.0; pdata[b+14]=RHO_REST0
     pbuf = device.create_buffer(size=N*PS*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.COPY_SRC)
     device.queue.write_buffer(pbuf, 0, pdata.tobytes())
     ga = device.create_buffer(size=NG*NG*3*4, usage=wgpu.BufferUsage.STORAGE)
@@ -75,7 +76,7 @@ def run_collapse(phi_deg, frames=250):
     rho_rest = (1/NG/0.006)**2
     device.queue.write_buffer(uni, 0, struct.pack("20f",
         DT, NG, 1/NG, GRAV,  MU, LA, alpha_from_phi(phi_deg), pmass,
-        0,0,0,0,  0, float(N), NG, pvol,  rho_rest, 0.02,0,0))
+        0,0,0,0,  0, float(N), NG, pvol,  rho_rest, 0.0,0,0))
     def bg(pipe, bufs):
         return device.create_bind_group(layout=pipe.get_bind_group_layout(0),
             entries=[{"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}} for i, b in enumerate(bufs)])
@@ -122,7 +123,7 @@ def disturb_cycle():
     N = len(pts)
     pdata = array.array("f", [0.0]*(N*PS))
     for i,(x,yy) in enumerate(pts):
-        b = i*PS; pdata[b]=x; pdata[b+1]=yy; pdata[b+8]=1.0; pdata[b+11]=1.0
+        b = i*PS; pdata[b]=x; pdata[b+1]=yy; pdata[b+8]=1.0; pdata[b+11]=1.0; pdata[b+14]=RHO_REST0
     pbuf = device.create_buffer(size=N*PS*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.COPY_SRC)
     device.queue.write_buffer(pbuf, 0, pdata.tobytes())
     ga = device.create_buffer(size=NG*NG*3*4, usage=wgpu.BufferUsage.STORAGE)
@@ -131,7 +132,7 @@ def disturb_cycle():
     rho_rest = (1/NG/0.006)**2
     device.queue.write_buffer(uni, 0, struct.pack("20f",
         DT, NG, 1/NG, GRAV, MU, LA, alpha_from_phi(30), 1.0,
-        0,0,0,0, 0, float(N), NG, 0.5, rho_rest, 0.02,0,0))
+        0,0,0,0, 0, float(N), NG, 0.5, rho_rest, 0.0,0,0))
     def bg(pipe, bufs):
         return device.create_bind_group(layout=pipe.get_bind_group_layout(0),
             entries=[{"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}} for i, b in enumerate(bufs)])
@@ -184,7 +185,7 @@ def stir_test():
     N = len(pts)
     pdata = array.array("f", [0.0]*(N*PS))
     for i,(x,yy) in enumerate(pts):
-        b = i*PS; pdata[b]=x; pdata[b+1]=yy; pdata[b+8]=1.0; pdata[b+11]=1.0
+        b = i*PS; pdata[b]=x; pdata[b+1]=yy; pdata[b+8]=1.0; pdata[b+11]=1.0; pdata[b+14]=RHO_REST0
     pbuf = device.create_buffer(size=N*PS*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.COPY_SRC)
     device.queue.write_buffer(pbuf, 0, pdata.tobytes())
     ga = device.create_buffer(size=NG*NG*3*4, usage=wgpu.BufferUsage.STORAGE)
@@ -194,7 +195,7 @@ def stir_test():
         rho_rest = (1/NG/0.006)**2
         device.queue.write_buffer(uni, 0, struct.pack("20f",
             DT, NG, 1/NG, GRAV, MU, LA, alpha_from_phi(20), 1.0,
-            mx, my, mvx, mvy, on, float(N), NG, 0.5, rho_rest, 0.02,0,0))
+            mx, my, mvx, mvy, on, float(N), NG, 0.5, rho_rest, 0.0,0,0))
     set_uni()
     def bg(pipe, bufs):
         return device.create_bind_group(layout=pipe.get_bind_group_layout(0),
@@ -234,6 +235,63 @@ def stir_test():
 h0, h1, vc0, vc1 = stir_test()
 print(f"stir test: settled {h0:.3f} -> after stir+settle {h1:.3f}   mean vc {vc0:.4f} -> {vc1:.4f}")
 check("PHYSICS: sustained stirring does not fluff (height within 15%)", h1 < h0*1.15, f"{h0:.3f} -> {h1:.3f}")
+
+# ---- boil test: deep pressurized fill + stir must decay to rest, no fountains ----
+def boil_test():
+    random.seed(9)
+    pts=[]; y=0.04
+    while y<0.72:
+        x=0.05
+        while x<0.95:
+            pts.append((x+(random.random()-0.5)*0.004,y+(random.random()-0.5)*0.004)); x+=0.007
+        y+=0.007
+    N=len(pts)
+    pd=array.array("f",[0.0]*(N*PS))
+    rr=(1/NG/0.007)**2
+    for i,(x,yy) in enumerate(pts):
+        b=i*PS; pd[b]=x; pd[b+1]=yy; pd[b+8]=1.0; pd[b+11]=1.0; pd[b+14]=rr
+    pbuf=device.create_buffer(size=N*PS*4,usage=wgpu.BufferUsage.STORAGE|wgpu.BufferUsage.COPY_DST|wgpu.BufferUsage.COPY_SRC)
+    device.queue.write_buffer(pbuf,0,pd.tobytes())
+    ga=device.create_buffer(size=NG*NG*3*4,usage=wgpu.BufferUsage.STORAGE)
+    gv=device.create_buffer(size=NG*NG*16,usage=wgpu.BufferUsage.STORAGE)
+    uni=device.create_buffer(size=80,usage=wgpu.BufferUsage.UNIFORM|wgpu.BufferUsage.COPY_DST)
+    def set_uni(mx=0.,my=0.,mvx=0.,mvy=0.,on=0.):
+        device.queue.write_buffer(uni,0,struct.pack("20f",DT,NG,1/NG,GRAV,MU,LA,alpha_from_phi(45),1.0,mx,my,mvx,mvy,on,float(N),NG,0.5,rr,0.0,0,0))
+    set_uni()
+    def bg(pipe,bufs): return device.create_bind_group(layout=pipe.get_bind_group_layout(0),
+        entries=[{"binding":i,"resource":{"buffer":b,"offset":0,"size":b.size}} for i,b in enumerate(bufs)])
+    bgs={"clear":bg(clear_p,[ga]),"p2g":bg(p2g_p,[pbuf,ga,uni]),
+         "grid":bg(grid_p,[ga,gv,uni]),"g2p":bg(g2p_p,[pbuf,gv,uni])}
+    def run(frames):
+        for f in range(frames):
+            enc=device.create_command_encoder()
+            for pp,k,wg in [(clear_p,'clear',(NG*NG*3+255)//256),(p2g_p,'p2g',(N+63)//64),
+                            (grid_p,'grid',(NG*NG+63)//64),(g2p_p,'g2p',(N+63)//64)]:
+                for _ in [0]:
+                    pass
+            for si in range(SUB):
+                for pp,k,wg in [(clear_p,'clear',(NG*NG*3+255)//256),(p2g_p,'p2g',(N+63)//64),
+                                (grid_p,'grid',(NG*NG+63)//64),(g2p_p,'g2p',(N+63)//64)]:
+                    cp=enc.begin_compute_pass(); cp.set_pipeline(pp); cp.set_bind_group(0,bgs[k])
+                    cp.dispatch_workgroups(wg); cp.end()
+            device.queue.submit([enc.finish()])
+    run(100)
+    for f in range(60):
+        ang=f*0.3
+        set_uni(0.5+0.25*math.cos(ang),0.35+0.2*math.sin(ang),-math.sin(ang)*1.8,math.cos(ang)*1.8,1.0)
+        run(1)
+    set_uni()
+    run(700)
+    out=array.array("f"); out.frombytes(bytes(device.queue.read_buffer(pbuf)))
+    ke=sum(out[i*PS+2]**2+out[i*PS+3]**2 for i in range(N))/N
+    hi=[math.hypot(out[i*PS+2],out[i*PS+3]) for i in range(N) if out[i*PS+1]>0.80]
+    hs=(sum(hi)/len(hi)) if hi else 0.0
+    return ke, hs
+
+bke, bhs = boil_test()
+print(f"boil test: tail ke {bke:.5f}, high-particle mean speed {bhs:.4f}")
+check("PHYSICS: no boiling (deep stirred fill decays to rest)", bke < 0.001 and bhs < 0.03,
+      f"ke {bke:.5f} speed {bhs:.4f}")
 
 lo = run_collapse(15)
 hi = run_collapse(45)
