@@ -117,14 +117,25 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   // gravity tick: the first time this frame a grain appears in a block's top
   // row it gets its acceleration (free fall) or decay (blocked) for the frame
   let mayTick = P.pidx + 2u < P.npass;   // no ticking after flags are cleared
+  // per-grain stochastic gravity (+1 with p=0.5 each frame) decorrelates
+  // velocity histories so same-frame spawn cohorts disperse instead of
+  // falling in lockstep bands; terminal dither keeps them drifting at cap
   if (mayTick && sandC(a) && !ticked(a)) {
     var va = velOf(a);
-    if (c == 0u) { va = min(va + P.gtick, 12u); } else { va = va - min(va, 2u); }
+    let ha = pcg((iA * 2654435761u) ^ P.seed);
+    if (c == 0u) {
+      va = min(va + ((ha >> 5u) & 1u), 12u);
+      if (va == 12u && (ha & 15u) == 0u) { va = 11u; }
+    } else { va = va - min(va, 2u); }
     a = tick(withVel(a, va));
   }
   if (mayTick && sandC(b) && !ticked(b)) {
     var vb = velOf(b);
-    if (d == 0u) { vb = min(vb + P.gtick, 12u); } else { vb = vb - min(vb, 2u); }
+    let hb = pcg((iB * 2654435761u) ^ P.seed);
+    if (d == 0u) {
+      vb = min(vb + ((hb >> 5u) & 1u), 12u);
+      if (vb == 12u && (hb & 15u) == 0u) { vb = 11u; }
+    } else { vb = vb - min(vb, 2u); }
     b = tick(withVel(b, vb));
   }
   // grounding: the bottom row never appears as a top cell, so handle it here
@@ -166,7 +177,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (jx < 0 || jx >= i32(S.w)) { return; }
   let jy = r2 % 5u;
   let i = jy * S.w + u32(jx);
-  if (cells[i] == 0u) { cells[i] = S.color | (3u << 8u); }
+  if (cells[i] == 0u) { cells[i] = S.color | ((1u + ((r2 >> 8u) % 5u)) << 8u); }
 }
 `;
 

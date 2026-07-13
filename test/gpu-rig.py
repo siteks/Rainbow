@@ -95,12 +95,21 @@ for f in range(70):
     if y >= H - 1: break
 dy = [ys[i+1] - ys[i] for i in range(len(ys) - 1)]
 print("dy per frame:", dy)
-# speeds over 2-frame windows (gravity ticks every other frame)
-pairs = [dy[i] + dy[i+1] for i in range(0, len(dy) - 1, 2)]
-nondecreasing = all(pairs[i+1] >= pairs[i] for i in range(min(8, len(pairs) - 1)))
-check("gravity: acceleration phase monotone", nondecreasing, str(pairs[:10]))
-check("gravity: starts slow (first-frame fall <= 2)", dy[0] <= 2, str(dy[0]))
-check("gravity: approaches terminal (max 2-frame fall >= 18)", max(pairs) >= 18, str(max(pairs)))
+early = sum(dy[:8]) / 8
+late = sum(dy[16:28]) / max(1, len(dy[16:28]))
+check("gravity: accelerates (late speed >> early speed)", late >= early + 3, f"early {early:.1f} late {late:.1f}")
+check("gravity: starts slow (first-frame fall <= 6)", dy[0] <= 6, str(dy[0]))
+check("gravity: approaches terminal (some frame falls >= 10)", max(dy) >= 10, str(max(dy)))
+
+# ---- 2b. cohort dispersion: same-frame spawns must NOT fall in a band ----
+grid = array.array("I", [0] * NCELLS)
+for x in range(4, 12): grid[2 * W + x] = 4  # 8 grains, one row, same "frame"
+upload(grid)
+for f in range(20): run_frame(f)
+data = download()
+cohort_ys = sorted(i // W for i, v in enumerate(data) if (v & 0xFF) == 4)
+spread = cohort_ys[-1] - cohort_ys[0] if cohort_ys else 0
+check("dispersion: same-frame cohort spreads >= 5 cells", spread >= 5, f"ys {cohort_ys}")
 
 # ---- 3. mass conservation under chaotic settling ----
 random.seed(7)
