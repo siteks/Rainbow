@@ -126,7 +126,7 @@ struct SpawnP { w: u32, h: u32, x: u32, color: u32, count: u32, seed: u32, pad0:
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= S.count) { return; }
-  let r1 = pcg(gid.x * 2654435761u ^ S.seed);
+  let r1 = pcg((gid.x * 2654435761u) ^ S.seed);
   let r2 = pcg(r1 ^ 0x9e3779b9u);
   let jx = i32(S.x) + i32(r1 % 41u) - 20;
   if (jx < 0 || jx >= i32(S.w)) { return; }
