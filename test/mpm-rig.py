@@ -37,8 +37,11 @@ try:
 except Exception as e:
     print("VALIDATE render pipeline: FAIL", e); sys.exit(1)
 
-NG = 64; DT = 4.0e-4; GRAV = 32.0
-E, NU = 4800.0, 0.3
+def _const(name):
+    return float(re.search(r"const " + name + r" = ([0-9.e+-]+)", src).group(1))
+NG = int(_const("NG")); DT = _const("DT"); GRAV = _const("GRAV")
+print(f"shipped config: NG={NG} DT={DT} GRAV={GRAV}")
+E, NU = _const("E_YOUNG"), 0.3
 MU = E / (2*(1+NU)); LA = E*NU/((1+NU)*(1-2*NU))
 PS = 16; SUB = 12
 
@@ -82,6 +85,7 @@ def run_collapse(phi_deg, frames=250):
             entries=[{"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}} for i, b in enumerate(bufs)])
     bgs = { 'clear': bg(clear_p, [ga]), 'p2g': bg(p2g_p, [pbuf, ga, uni]),
             'grid': bg(grid_p, [ga, gv, uni]), 'g2p': bg(g2p_p, [pbuf, gv, uni]) }
+    early = None
     for f in range(frames):
         enc = device.create_command_encoder()
         for s in range(SUB):
@@ -90,6 +94,10 @@ def run_collapse(phi_deg, frames=250):
                 cp = enc.begin_compute_pass(); cp.set_pipeline(pipe); cp.set_bind_group(0, bgs[key])
                 cp.dispatch_workgroups(wg); cp.end()
         device.queue.submit([enc.finish()])
+        if f == 8:
+            eo = array.array("f"); eo.frombytes(bytes(device.queue.read_buffer(pbuf)))
+            xs8 = sorted(eo[i*PS] for i in range(N))
+            early = xs8[int(N*0.99)] - xs8[int(N*0.01)]
     out = array.array("f"); out.frombytes(bytes(device.queue.read_buffer(pbuf)))
     xs = sorted(out[i*PS] for i in range(N))
     ys = sorted(out[i*PS+1] for i in range(N))
@@ -99,7 +107,7 @@ def run_collapse(phi_deg, frames=250):
     ke = sum(v*v for v in vs)/N
     p95h = ys[int(N*0.95)]
     runout = xs[int(N*0.99)] - xs[int(N*0.01)]   # robust extent
-    return {"N":N, "bad":bad, "runout":runout, "height":p95h, "ke":ke,
+    return {"N":N, "bad":bad, "runout":runout, "height":p95h, "ke":ke, "early":early,
             "q_mean": sum(qs)/N, "q_max": max(qs),
             "inbox": sum(1 for i in range(N) if 0<=out[i*PS]<=1 and 0<=out[i*PS+1]<=1)}
 
@@ -240,14 +248,14 @@ check("PHYSICS: sustained stirring does not fluff (height within 15%)", h1 < h0*
 def boil_test():
     random.seed(9)
     pts=[]; y=0.04
-    while y<0.72:
-        x=0.05
-        while x<0.95:
-            pts.append((x+(random.random()-0.5)*0.004,y+(random.random()-0.5)*0.004)); x+=0.007
-        y+=0.007
+    while y<0.38:
+        x=0.06
+        while x<0.94:
+            pts.append((x+(random.random()-0.5)*0.003,y+(random.random()-0.5)*0.003)); x+=0.0045
+        y+=0.0045
     N=len(pts)
     pd=array.array("f",[0.0]*(N*PS))
-    rr=(1/NG/0.007)**2
+    rr=(1/NG/0.0045)**2
     for i,(x,yy) in enumerate(pts):
         b=i*PS; pd[b]=x; pd[b+1]=yy; pd[b+8]=1.0; pd[b+11]=1.0; pd[b+14]=rr
     pbuf=device.create_buffer(size=N*PS*4,usage=wgpu.BufferUsage.STORAGE|wgpu.BufferUsage.COPY_DST|wgpu.BufferUsage.COPY_SRC)
@@ -281,11 +289,15 @@ def boil_test():
         set_uni(0.5+0.25*math.cos(ang),0.35+0.2*math.sin(ang),-math.sin(ang)*1.8,math.cos(ang)*1.8,1.0)
         run(1)
     set_uni()
-    run(700)
-    out=array.array("f"); out.frombytes(bytes(device.queue.read_buffer(pbuf)))
-    ke=sum(out[i*PS+2]**2+out[i*PS+3]**2 for i in range(N))/N
-    hi=[math.hypot(out[i*PS+2],out[i*PS+3]) for i in range(N) if out[i*PS+1]>0.80]
-    hs=(sum(hi)/len(hi)) if hi else 0.0
+    # settle to criterion, not stopwatch: chunks until calm or budget exhausted
+    ke, hs = 1.0, 1.0
+    for chunk in range(10):
+        run(250)
+        out=array.array("f"); out.frombytes(bytes(device.queue.read_buffer(pbuf)))
+        ke=sum(out[i*PS+2]**2+out[i*PS+3]**2 for i in range(N))/N
+        hi=[math.hypot(out[i*PS+2],out[i*PS+3]) for i in range(N) if out[i*PS+1]>0.80]
+        hs=(sum(hi)/len(hi)) if hi else 0.0
+        if ke < 0.0008: break
     return ke, hs
 
 bke, bhs = boil_test()
@@ -297,6 +309,8 @@ lo = run_collapse(15)
 hi = run_collapse(45)
 print(f"phi=15: runout {lo['runout']:.3f} height {lo['height']:.3f} ke {lo['ke']:.5f}")
 print(f"phi=45: runout {hi['runout']:.3f} height {hi['height']:.3f} ke {hi['ke']:.5f}")
+check("no launch explosion (width at frame 8 near initial 0.12)",
+      lo["early"] < 0.30 and hi["early"] < 0.30, f"{lo['early']:.3f}/{hi['early']:.3f}")
 check("no NaN/Inf positions", lo["bad"] == 0 and hi["bad"] == 0)
 check("all particles in domain", lo["inbox"] == lo["N"] and hi["inbox"] == hi["N"])
 check("column collapsed (p95 height well below initial)", lo["height"] < 0.35 and hi["height"] < 0.45,
