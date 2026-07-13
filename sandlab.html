@@ -78,7 +78,7 @@
 
 <script type="module">
 const NG = 100;                // grid nodes per side
-const MAXP = 60000;
+const MAXP = 250000;   // buffer prealloc: 16MB. The GPU meter is the real limit.
 const SIM_SPEED = 0.30;        // sim-seconds per real second, refresh-rate independent
 const MAX_SUBSTEPS = 26;       // cost ceiling / spiral-of-death guard
 const DT = 4.0e-4;
