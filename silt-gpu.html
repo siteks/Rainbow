@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Rainbow Silt GPU</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    background: #1a1430;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+  }
+  canvas { position: fixed; left: 0; }
+  #gpu { z-index: 0; }
+  #ui { top: 0; width: 100%; height: 100%; z-index: 1; }
+  #overlay {
+    position: fixed; inset: 0; z-index: 2;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    text-align: center; color: #f4f0ff;
+    background: rgba(26, 20, 48, 0.72);
+    backdrop-filter: blur(4px);
+    transition: opacity 0.25s; padding: 24px;
+  }
+  #overlay.hidden { opacity: 0; pointer-events: none; }
+  #overlay h1 {
+    font-size: 38px; font-weight: 800;
+    background: linear-gradient(90deg,#ff5a5f,#ffd93d,#4ecb71,#4ea8ff,#b06cff);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  #overlay p { margin-top: 14px; font-size: 14.5px; color: #b8aede; max-width: 310px; line-height: 1.65; }
+  #overlay .go-score { margin-top: 10px; font-size: 16px; color: #ffd93d; letter-spacing: 1px; }
+  #overlay .err { margin-top: 14px; font-size: 12px; color: #ff5a5f; max-width: 320px; word-break: break-word; }
+  #overlay .tap {
+    margin-top: 30px; font-size: 11px; letter-spacing: 4px;
+    text-transform: uppercase; color: #7c6fae;
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+</style>
+</head>
+<body>
+<canvas id="gpu"></canvas>
+<canvas id="ui"></canvas>
+<div id="overlay">
+  <h1>Rainbow Silt GPU</h1>
+  <p id="msg">The same sand — but a quarter of a million cells, simulated and rendered entirely on your GPU. Pour streams, bridge the walls with one color, light up all five.</p>
+  <div class="go-score" id="goScore"></div>
+  <div class="err" id="err"></div>
+  <div class="tap" id="tapmsg">Checking WebGPU…</div>
+</div>
+
+<script type="module">
+const NCOLORS = 5;
+const COLORS = ['#ff5a5f','#ffd93d','#4ecb71','#4ea8ff','#b06cff'];
+const PRAISE = ['Well done!', 'Brilliant!', 'Splendid!', 'Nice one!', 'Superb!', 'Lovely stuff!'];
+const STONE = 6;
+const GRAINS_PER_BLOB = 12000;
+const SPAWN_PER_FRAME = 380;
+const STEPS_PER_FRAME = 8;
+
+const uiCanvas = document.getElementById('ui');
+const uiCtx = uiCanvas.getContext('2d');
+const gpuCanvas = document.getElementById('gpu');
+const overlay = document.getElementById('overlay');
+const msgEl = document.getElementById('msg');
+const goScoreEl = document.getElementById('goScore');
+const errEl = document.getElementById('err');
+const tapEl = document.getElementById('tapmsg');
+
+function fatal(text) {
+  errEl.textContent = text;
+  tapEl.textContent = 'WebGPU unavailable';
+  overlay.classList.remove('hidden');
+}
+
+// ---------------- WGSL ----------------
+const WGSL_COMMON = /* wgsl */`
+fn pcg(v: u32) -> u32 {
+  var x = v * 747796405u + 2891336453u;
+  x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+  return (x >> 22u) ^ x;
+}
+fn isSand(v: u32) -> bool { return v >= 1u && v <= 5u; }
+`;
+
+const WGSL_STEP = WGSL_COMMON + /* wgsl */`
+struct Params { w: u32, h: u32, offset: u32, seed: u32 };
+@group(0) @binding(0) var<storage, read_write> cells : array<u32>;
+@group(0) @binding(1) var<uniform> P : Params;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let bx = gid.x * 2u + P.offset;
+  let by = gid.y * 2u + P.offset;
+  if (bx + 1u >= P.w || by + 1u >= P.h) { return; }
+  let iA = by * P.w + bx;
+  let iB = iA + 1u;
+  let iC = iA + P.w;
+  let iD = iC + 1u;
+  var a = cells[iA]; var b = cells[iB];
+  var c = cells[iC]; var d = cells[iD];
+  // straight falls within the block
+  if (isSand(a) && c == 0u) { c = a; a = 0u; }
+  if (isSand(b) && d == 0u) { d = b; b = 0u; }
+  // stochastic diagonal topple (~75%): irregular slopes
+  let r = pcg(iA ^ P.seed);
+  if ((r & 3u) != 0u) {
+    if (isSand(a) && c != 0u && d == 0u && b == 0u) { d = a; a = 0u; }
+    else if (isSand(b) && d != 0u && c == 0u && a == 0u) { c = b; b = 0u; }
+  }
+  cells[iA] = a; cells[iB] = b; cells[iC] = c; cells[iD] = d;
+}
+`;
+
+const WGSL_SPAWN = WGSL_COMMON + /* wgsl */`
+struct SpawnP { w: u32, h: u32, x: u32, color: u32, count: u32, seed: u32, pad0: u32, pad1: u32 };
+@group(0) @binding(0) var<storage, read_write> cells : array<u32>;
+@group(0) @binding(1) var<uniform> S : SpawnP;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= S.count) { return; }
+  let r1 = pcg(gid.x * 2654435761u ^ S.seed);
+  let r2 = pcg(r1 ^ 0x9e3779b9u);
+  let jx = i32(S.x) + i32(r1 % 41u) - 20;
+  if (jx < 0 || jx >= i32(S.w)) { return; }
+  let jy = r2 % 5u;
+  let i = jy * S.w + u32(jx);
+  if (cells[i] == 0u) { cells[i] = S.color; }
+}
+`;
+
+const WGSL_CLEAR = /* wgsl */`
+struct ClearP { count: u32, pad0: u32, pad1: u32, pad2: u32 };
+@group(0) @binding(0) var<storage, read_write> cells : array<u32>;
+@group(0) @binding(1) var<storage, read> list : array<u32>;
+@group(0) @binding(2) var<uniform> C : ClearP;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= C.count) { return; }
+  cells[list[gid.x]] = 0u;
+}
+`;
+
+const WGSL_RENDER = WGSL_COMMON + /* wgsl */`
+struct RP { w: u32, h: u32, cw: u32, ch: u32 };
+@group(0) @binding(0) var<storage, read> cells : array<u32>;
+@group(0) @binding(1) var<uniform> R : RP;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -3.0), vec2<f32>(3.0, 1.0), vec2<f32>(-1.0, 1.0));
+  return vec4<f32>(pos[vi], 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) fc : vec4<f32>) -> @location(0) vec4<f32> {
+  let bg = vec3<f32>(0.102, 0.078, 0.188);
+  let x = min(u32(fc.x * f32(R.w) / f32(R.cw)), R.w - 1u);
+  let y = min(u32(fc.y * f32(R.h) / f32(R.ch)), R.h - 1u);
+  let i = y * R.w + x;
+  let v = cells[i];
+  if (v == 0u) { return vec4<f32>(bg, 1.0); }
+  var col : vec3<f32>;
+  if (v == 1u)      { col = vec3<f32>(1.000, 0.353, 0.373); }
+  else if (v == 2u) { col = vec3<f32>(1.000, 0.851, 0.239); }
+  else if (v == 3u) { col = vec3<f32>(0.306, 0.796, 0.443); }
+  else if (v == 4u) { col = vec3<f32>(0.306, 0.659, 1.000); }
+  else if (v == 5u) { col = vec3<f32>(0.690, 0.424, 1.000); }
+  else              { col = vec3<f32>(0.360, 0.337, 0.502); }  // stone
+  let shade = 0.80 + 0.20 * f32(pcg(i) & 31u) / 31.0;
+  // gentle top light
+  let light = 1.0 - 0.12 * f32(y) / f32(R.h);
+  return vec4<f32>(col * shade * light, 1.0);
+}
+`;
+
+// ---------------- init ----------------
+let device, ctxGpu, format;
+let SIMW = 384, SIMH = 512;
+let cellsBuf, stagingBuf, listBuf;
+let stepPipe, spawnPipe, clearPipe, renderPipe;
+let stepBGs = [], spawnBG, clearBG, renderBG;
+let stepUnis = [], spawnUni, clearUni, renderUni;
+let W, H, simYcss, simHcss, pxCss, trayY;
+
+async function initGPU() {
+  if (!navigator.gpu) { fatal('This browser has no WebGPU. On Android use recent Chrome; the CPU version at silt.html works everywhere.'); return false; }
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) { fatal('WebGPU adapter unavailable (GPU may be blocklisted).'); return false; }
+  device = await adapter.requestDevice();
+  device.addEventListener('uncapturederror', (e) => fatal('GPU error: ' + e.error.message));
+  format = navigator.gpu.getPreferredCanvasFormat();
+
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  W = window.innerWidth; H = window.innerHeight;
+  uiCanvas.width = W * dpr; uiCanvas.height = H * dpr;
+  uiCanvas.style.width = W + 'px'; uiCanvas.style.height = H + 'px';
+  uiCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  // sim area geometry
+  simYcss = Math.floor(H * 0.24);
+  simHcss = Math.floor(H * 0.68);
+  pxCss = W / SIMW;
+  SIMH = Math.floor(simHcss / pxCss) & ~1;  // even
+  SIMH = Math.max(128, Math.min(768, SIMH));
+  simHcss = SIMH * pxCss;
+  trayY = simYcss - Math.min(64, H * 0.09);
+
+  gpuCanvas.style.top = simYcss + 'px';
+  gpuCanvas.style.width = W + 'px';
+  gpuCanvas.style.height = simHcss + 'px';
+  gpuCanvas.width = Math.floor(W * dpr);
+  gpuCanvas.height = Math.floor(simHcss * dpr);
+
+  ctxGpu = gpuCanvas.getContext('webgpu');
+  ctxGpu.configure({ device, format, alphaMode: 'opaque' });
+
+  const nCells = SIMW * SIMH;
+  cellsBuf = device.createBuffer({ size: nCells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  stagingBuf = device.createBuffer({ size: nCells * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  listBuf = device.createBuffer({ size: nCells * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+
+  async function makePipeline(code, entry) {
+    const mod = device.createShaderModule({ code });
+    const info = await mod.getCompilationInfo();
+    const errs = info.messages.filter(m => m.type === 'error');
+    if (errs.length) { fatal('WGSL: ' + errs.map(m => m.lineNum + ':' + m.linePos + ' ' + m.message).join(' | ')); throw new Error('wgsl'); }
+    return device.createComputePipelineAsync({ layout: 'auto', compute: { module: mod, entryPoint: entry } });
+  }
+
+  stepPipe = await makePipeline(WGSL_STEP, 'main');
+  spawnPipe = await makePipeline(WGSL_SPAWN, 'main');
+  clearPipe = await makePipeline(WGSL_CLEAR, 'main');
+
+  const rmod = device.createShaderModule({ code: WGSL_RENDER });
+  const rinfo = await rmod.getCompilationInfo();
+  const rerrs = rinfo.messages.filter(m => m.type === 'error');
+  if (rerrs.length) { fatal('WGSL render: ' + rerrs.map(m => m.message).join(' | ')); return false; }
+  renderPipe = await device.createRenderPipelineAsync({
+    layout: 'auto',
+    vertex: { module: rmod, entryPoint: 'vs' },
+    fragment: { module: rmod, entryPoint: 'fs', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' }
+  });
+
+  // uniforms: two step-params (offset 0 / 1), spawn, clear, render
+  for (let o = 0; o < 2; o++) {
+    const u = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    stepUnis.push(u);
+    stepBGs.push(device.createBindGroup({ layout: stepPipe.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: cellsBuf } }, { binding: 1, resource: { buffer: u } }] }));
+  }
+  spawnUni = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  spawnBG = device.createBindGroup({ layout: spawnPipe.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: cellsBuf } }, { binding: 1, resource: { buffer: spawnUni } }] });
+  clearUni = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  clearBG = device.createBindGroup({ layout: clearPipe.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: cellsBuf } }, { binding: 1, resource: { buffer: listBuf } },
+              { binding: 2, resource: { buffer: clearUni } }] });
+  renderUni = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(renderUni, 0, new Uint32Array([SIMW, SIMH, gpuCanvas.width, gpuCanvas.height]));
+  renderBG = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: cellsBuf } }, { binding: 1, resource: { buffer: renderUni } }] });
+
+  tapEl.textContent = 'Tap to play';
+  return true;
+}
+
+// ---------------- game state ----------------
+let phase = 'boot';
+let bagQ = [], current = 0, next1 = 1;
+let score = 0, best = 0, bestRound = 1;
+let round = 1, colorsDone = [], fanfareT = 0, praise = '', fanfarePraised = false;
+let pour = null, settleT = 0, chain = 0, needJudge = false;
+let floats = [], confetti = [], sparkles = [];
+let timeLeft = 7, turnTime = 7;
+let frameCount = 0, fps = 60, fpsAcc = 0, fpsN = 0;
+let grainCount = 0, mapping = false;
+
+function drawBagColor() {
+  if (bagQ.length === 0) {
+    for (let i = 0; i < NCOLORS; i++) bagQ.push(i, i);
+    for (let i = bagQ.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [bagQ[i], bagQ[j]] = [bagQ[j], bagQ[i]];
+    }
+  }
+  return bagQ.pop();
+}
+function baseTurnTime() { return Math.max(3.5, 8 - 0.5 * (round - 1)); }
+function newTurn() { turnTime = baseTurnTime(); timeLeft = turnTime; }
+function advanceQueue() { current = next1; next1 = drawBagColor(); newTurn(); }
+function addFloat(text, x, y, color) { floats.push({ text, x, y, life: 1, color }); }
+function burstConfetti() {
+  for (let i = 0; i < 70; i++) confetti.push({
+    x: Math.random() * W, y: -20 - Math.random() * H * 0.3,
+    vy: 180 + Math.random() * 220, vx: (Math.random() - 0.5) * 60,
+    rot: Math.random() * Math.PI, vr: (Math.random() - 0.5) * 8,
+    color: COLORS[Math.floor(Math.random() * NCOLORS)], life: 1 });
+}
+
+function startRound(n) {
+  round = n;
+  colorsDone = new Array(NCOLORS).fill(false);
+  chain = 0; pour = null; needJudge = false;
+  // fresh board + stone clusters, uploaded whole (intended full-state write)
+  const g = new Uint32Array(SIMW * SIMH);
+  const clusters = Math.min(10, (round - 1) * 2);
+  for (let k = 0; k < clusters; k++) {
+    const cx = 30 + Math.floor(Math.random() * (SIMW - 60));
+    const cy = Math.floor(SIMH * 0.35 + Math.random() * SIMH * 0.5);
+    const rad = 10 + Math.floor(Math.random() * 16);
+    for (let y = -rad; y <= rad; y++)
+      for (let x = -rad; x <= rad; x++) {
+        if (x * x + y * y > rad * rad) continue;
+        const gx = cx + x, gy = cy + y;
+        if (gx >= 0 && gx < SIMW && gy >= 0 && gy < SIMH) g[gy * SIMW + gx] = STONE;
+      }
+  }
+  device.queue.writeBuffer(cellsBuf, 0, g);
+  newTurn();
+  phase = 'idle';
+}
+
+function reset() {
+  bagQ = [];
+  current = drawBagColor(); next1 = drawBagColor();
+  score = 0; floats = []; confetti = []; sparkles = [];
+  startRound(1);
+}
+
+function startPour(x, forced) {
+  if (forced) addFloat('AUTO', x * pxCss, simYcss - 14, '#ff5a5f');
+  pour = { x, color: current, remaining: GRAINS_PER_BLOB };
+  phase = 'pour';
+}
+function forcedPour() { startPour(30 + Math.floor(Math.random() * (SIMW - 60)), true); }
+
+function gameOver() {
+  phase = 'over';
+  if (score > best) best = score;
+  if (round > bestRound) bestRound = round;
+  msgEl.innerHTML = 'The sand reached the top on round ' + round + '.';
+  goScoreEl.textContent = 'Score ' + score + '  ·  Best ' + best + ' (round ' + bestRound + ')';
+  setTimeout(() => overlay.classList.remove('hidden'), 400);
+}
+
+// ---------------- async readback: bridges, occupancy, judging ----------------
+function processReadback(data) {
+  let grains = 0;
+  for (let i = 0; i < data.length; i++) { const v = data[i]; if (v >= 1 && v <= 5) grains++; }
+  grainCount = grains;
+
+  // bridge detection: same-color component touching both walls
+  const seen = new Uint8Array(data.length);
+  const clearedCells = [];
+  const clearedColors = [];
+  for (let y = 0; y < SIMH; y++) {
+    const start = y * SIMW;
+    const v = data[start];
+    if (v === 0 || v === STONE || seen[start]) continue;
+    const comp = [start];
+    seen[start] = 1;
+    let touchesRight = false;
+    for (let head = 0; head < comp.length; head++) {
+      const i = comp[head];
+      const cx = i % SIMW;
+      if (cx === SIMW - 1) touchesRight = true;
+      if (cx > 0            && !seen[i - 1]    && data[i - 1] === v)    { seen[i - 1] = 1;    comp.push(i - 1); }
+      if (cx < SIMW - 1     && !seen[i + 1]    && data[i + 1] === v)    { seen[i + 1] = 1;    comp.push(i + 1); }
+      if (i >= SIMW         && !seen[i - SIMW] && data[i - SIMW] === v) { seen[i - SIMW] = 1; comp.push(i - SIMW); }
+      if (i < data.length - SIMW && !seen[i + SIMW] && data[i + SIMW] === v) { seen[i + SIMW] = 1; comp.push(i + SIMW); }
+    }
+    if (touchesRight && comp.length >= 200) {
+      for (const i of comp) clearedCells.push(i);
+      clearedColors.push(v - 1);
+    }
+  }
+
+  if (clearedCells.length > 0 && (phase === 'idle' || phase === 'pour' || phase === 'settle' || phase === 'judge')) {
+    chain++;
+    const pts = Math.round(clearedCells.length / 8 * chain);
+    score += pts;
+    for (const c of clearedColors) colorsDone[c] = true;
+    let label = '+' + pts;
+    if (chain > 1) label = 'CHAIN x' + chain + '  ' + label;
+    addFloat(label, W / 2, simYcss + 40, chain > 1 ? '#ffd93d' : '#ffffff');
+    // GPU-side clear via list compute pass
+    const list = new Uint32Array(clearedCells);
+    device.queue.writeBuffer(listBuf, 0, list);
+    device.queue.writeBuffer(clearUni, 0, new Uint32Array([list.length, 0, 0, 0]));
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(clearPipe);
+    pass.setBindGroup(0, clearBG);
+    pass.dispatchWorkgroups(Math.ceil(list.length / 64));
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    // wash sparkles on the UI canvas (sampled)
+    for (let k = 0; k < clearedCells.length; k += 60) {
+      const i = clearedCells[k];
+      sparkles.push({ x: (i % SIMW) * pxCss, y: simYcss + ((i / SIMW) | 0) * pxCss,
+        vy: 40 + Math.random() * 120, life: 0.8 + Math.random() * 0.4 });
+    }
+    if (phase === 'judge') { settleT = 0; phase = 'settle'; needJudge = true; }  // let cascades develop
+    return;
+  }
+
+  if (phase === 'judge' && needJudge) {
+    needJudge = false;
+    // top blocked?
+    let topFilled = 0;
+    for (let y = 0; y < 6; y++)
+      for (let x = 0; x < SIMW; x++)
+        if (data[y * SIMW + x] !== 0) topFilled++;
+    if (colorsDone.every(v => v)) {
+      phase = 'fanfare'; fanfareT = 0; fanfarePraised = false;
+      praise = PRAISE[Math.floor(Math.random() * PRAISE.length)];
+      burstConfetti();
+      addFloat('ROUND ' + round + ' CLEAR!', W / 2, H * 0.5, '#ffd93d');
+    } else if (topFilled > SIMW * 2.5) {
+      gameOver();
+    } else {
+      chain = 0;
+      advanceQueue();
+      phase = 'idle';
+    }
+  }
+}
+
+async function readback() {
+  if (mapping || !device) return;
+  mapping = true;
+  try {
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(cellsBuf, 0, stagingBuf, 0, SIMW * SIMH * 4);
+    device.queue.submit([enc.finish()]);
+    await stagingBuf.mapAsync(GPUMapMode.READ);
+    const data = new Uint32Array(stagingBuf.getMappedRange().slice(0));
+    stagingBuf.unmap();
+    processReadback(data);
+  } catch (e) {
+    // device lost or map raced a reconfigure; surface once
+    if (phase !== 'over') fatal('GPU readback failed: ' + e.message);
+  } finally {
+    mapping = false;
+  }
+}
+
+// ---------------- input ----------------
+window.addEventListener('pointerdown', (e) => {
+  if (phase === 'boot') return;
+  if (phase === 'menu' || phase === 'over') {
+    overlay.classList.add('hidden');
+    reset();
+    return;
+  }
+  if (phase !== 'idle') return;
+  const y = e.clientY;
+  if (y < trayY || y > simYcss + simHcss) return;
+  const sx = Math.max(20, Math.min(SIMW - 21, Math.round(e.clientX / pxCss)));
+  startPour(sx, false);
+});
+
+// ---------------- UI helpers ----------------
+function roundRect(x, y, w, h, rad) {
+  uiCtx.beginPath();
+  uiCtx.moveTo(x + rad, y);
+  uiCtx.arcTo(x + w, y, x + w, y + h, rad);
+  uiCtx.arcTo(x + w, y + h, x, y + h, rad);
+  uiCtx.arcTo(x, y + h, x, y, rad);
+  uiCtx.arcTo(x, y, x + w, y, rad);
+  uiCtx.closePath();
+}
+
+// ---------------- main loop ----------------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  frameCount++;
+  fpsAcc += dt; fpsN++;
+  if (fpsAcc > 0.5) { fps = Math.round(fpsN / fpsAcc); fpsAcc = 0; fpsN = 0; }
+
+  // ---- GPU work ----
+  if (device && phase !== 'boot' && phase !== 'menu') {
+    const enc = device.createCommandEncoder();
+
+    if (phase === 'pour' && pour) {
+      const n = Math.min(SPAWN_PER_FRAME, pour.remaining);
+      device.queue.writeBuffer(spawnUni, 0, new Uint32Array([SIMW, SIMH, pour.x, pour.color + 1, n, (Math.random() * 0xffffffff) >>> 0, 0, 0]));
+      const sp = enc.beginComputePass();
+      sp.setPipeline(spawnPipe);
+      sp.setBindGroup(0, spawnBG);
+      sp.dispatchWorkgroups(Math.ceil(n / 64));
+      sp.end();
+      pour.remaining -= n;   // approximate: congested cells drop some grains, that's fine
+      if (pour.remaining <= 0) { pour = null; settleT = 0; phase = 'settle'; needJudge = true; }
+    }
+
+    if (phase === 'idle' || phase === 'pour' || phase === 'settle' || phase === 'judge') {
+      for (let s = 0; s < STEPS_PER_FRAME; s++) {
+        const off = s & 1;
+        device.queue.writeBuffer(stepUnis[off], 0, new Uint32Array([SIMW, SIMH, off, (Math.random() * 0xffffffff) >>> 0]));
+        const cp = enc.beginComputePass();
+        cp.setPipeline(stepPipe);
+        cp.setBindGroup(0, stepBGs[off]);
+        cp.dispatchWorkgroups(Math.ceil(SIMW / 2 / 8), Math.ceil(SIMH / 2 / 8));
+        cp.end();
+      }
+    }
+
+    const view = ctxGpu.getCurrentTexture().createView();
+    const rp = enc.beginRenderPass({ colorAttachments: [{ view, clearValue: { r: 0.102, g: 0.078, b: 0.188, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+    rp.setPipeline(renderPipe);
+    rp.setBindGroup(0, renderBG);
+    rp.draw(3);
+    rp.end();
+    device.queue.submit([enc.finish()]);
+
+    if (frameCount % 18 === 0) readback();
+  }
+
+  // ---- game logic timers ----
+  if (phase === 'idle') {
+    timeLeft -= dt;
+    if (timeLeft <= 0) forcedPour();
+  }
+  if (phase === 'settle') {
+    settleT += dt;
+    if (settleT > 0.9) phase = 'judge';   // decision happens on next readback
+  }
+  if (phase === 'fanfare') {
+    fanfareT += dt;
+    if (fanfareT > 2.6) { startRound(round + 1); advanceQueue(); }
+  }
+
+  // ---- UI canvas ----
+  uiCtx.clearRect(0, 0, W, H);
+  if (phase !== 'boot' && phase !== 'menu') {
+    uiCtx.fillStyle = '#f4f0ff';
+    uiCtx.font = '200 34px system-ui';
+    uiCtx.textAlign = 'center';
+    uiCtx.fillText(score, W / 2, H * 0.07);
+    uiCtx.fillStyle = '#7c6fae';
+    uiCtx.font = '600 11px system-ui';
+    uiCtx.fillText('ROUND ' + round, W / 2, H * 0.07 + 20);
+
+    const swy = H * 0.07 + 34, sw = 16;
+    for (let c = 0; c < NCOLORS; c++) {
+      const sx = W / 2 + (c - 2) * (sw + 8) - sw / 2;
+      uiCtx.globalAlpha = colorsDone[c] ? 1 : 0.22;
+      uiCtx.fillStyle = COLORS[c];
+      roundRect(sx, swy, sw, sw, 5);
+      uiCtx.fill();
+      uiCtx.globalAlpha = 1;
+    }
+
+    const ts = 34;
+    uiCtx.fillStyle = '#7c6fae';
+    uiCtx.font = '600 10px system-ui';
+    uiCtx.fillText('POUR', W / 2, trayY - 8);
+    uiCtx.fillStyle = COLORS[current];
+    uiCtx.beginPath(); uiCtx.arc(W / 2, trayY + ts / 2, ts / 2, 0, Math.PI * 2); uiCtx.fill();
+    uiCtx.globalAlpha = 0.55;
+    uiCtx.fillStyle = COLORS[next1];
+    uiCtx.beginPath(); uiCtx.arc(W / 2 + ts * 1.3, trayY + ts / 2, ts / 3, 0, Math.PI * 2); uiCtx.fill();
+    uiCtx.globalAlpha = 1;
+
+    const frac = Math.max(0, timeLeft / turnTime);
+    const elapsedFrac = 1 - frac;
+    const tr = 13, tcx = W / 2 - ts * 1.5, tcy = trayY + ts / 2;
+    uiCtx.beginPath(); uiCtx.arc(tcx, tcy, tr, 0, Math.PI * 2);
+    uiCtx.fillStyle = 'rgba(255,255,255,0.06)'; uiCtx.fill();
+    uiCtx.strokeStyle = 'rgba(124,111,174,0.35)'; uiCtx.lineWidth = 1; uiCtx.stroke();
+    if (elapsedFrac > 0 && phase === 'idle') {
+      uiCtx.beginPath();
+      uiCtx.moveTo(tcx, tcy);
+      uiCtx.arc(tcx, tcy, tr, -Math.PI / 2, -Math.PI / 2 + elapsedFrac * Math.PI * 2);
+      uiCtx.closePath();
+      uiCtx.fillStyle = frac > 0.35 ? 'rgba(124,111,174,0.55)' : 'rgba(255,90,95,0.85)';
+      uiCtx.fill();
+    }
+
+    // GPU flex line
+    uiCtx.fillStyle = 'rgba(124,111,174,0.55)';
+    uiCtx.font = '10px system-ui';
+    uiCtx.fillText((SIMW * SIMH).toLocaleString() + ' cells · ' + grainCount.toLocaleString() + ' grains · ' + fps + ' fps · WebGPU', W / 2, simYcss + simHcss + 16);
+
+    // wash sparkles
+    for (const s of sparkles) {
+      s.life -= dt * 1.4;
+      s.y += s.vy * dt;
+      if (s.life <= 0) continue;
+      uiCtx.globalAlpha = Math.min(1, s.life);
+      uiCtx.fillStyle = '#ffffff';
+      uiCtx.fillRect(s.x, s.y, 2, 2);
+      uiCtx.globalAlpha = 1;
+    }
+    sparkles = sparkles.filter(s => s.life > 0);
+
+    if (phase === 'fanfare' && fanfareT > 0.85) {
+      if (!fanfarePraised) { fanfarePraised = true; burstConfetti(); }
+      const t = Math.min(1, (fanfareT - 0.85) * 4);
+      const pop = 1 + 0.18 * Math.sin(t * Math.PI);
+      uiCtx.save();
+      uiCtx.translate(W / 2, H * 0.44);
+      uiCtx.scale(pop, pop);
+      uiCtx.globalAlpha = t;
+      uiCtx.fillStyle = '#ffffff';
+      uiCtx.font = '800 36px system-ui';
+      uiCtx.fillText(praise, 0, 0);
+      uiCtx.globalAlpha = t * 0.8;
+      uiCtx.fillStyle = '#b8aede';
+      uiCtx.font = '600 14px system-ui';
+      uiCtx.fillText('Get ready for round ' + (round + 1), 0, 30);
+      uiCtx.restore();
+      uiCtx.globalAlpha = 1;
+    }
+  }
+
+  for (const p of confetti) {
+    p.y += p.vy * dt; p.x += p.vx * dt; p.rot += p.vr * dt;
+    if (p.y > H + 20) p.life = 0;
+    if (p.life <= 0) continue;
+    uiCtx.save();
+    uiCtx.translate(p.x, p.y);
+    uiCtx.rotate(p.rot);
+    uiCtx.fillStyle = p.color;
+    uiCtx.fillRect(-4, -2.5, 8, 5);
+    uiCtx.restore();
+  }
+  confetti = confetti.filter(p => p.life > 0);
+
+  for (const f of floats) {
+    f.life -= dt * (f.text.startsWith('ROUND') ? 0.55 : 0.8);
+    f.y -= 28 * dt;
+    if (f.life <= 0) continue;
+    uiCtx.globalAlpha = Math.min(1, f.life);
+    uiCtx.fillStyle = f.color;
+    uiCtx.font = f.text.startsWith('ROUND') ? '800 30px system-ui' : '700 20px system-ui';
+    uiCtx.textAlign = 'center';
+    uiCtx.fillText(f.text, f.x, f.y);
+    uiCtx.globalAlpha = 1;
+  }
+  floats = floats.filter(f => f.life > 0);
+
+  requestAnimationFrame(frame);
+}
+
+initGPU().then(ok => { if (ok) { phase = 'menu'; requestAnimationFrame(frame); } });
+</script>
+</body>
+</html>
