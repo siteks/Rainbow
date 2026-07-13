@@ -25,10 +25,11 @@ try:
     device.create_render_pipeline(
         layout="auto",
         vertex={"module": mods["WGSL_RENDER"], "entry_point": "vs", "buffers": [{
-            "array_stride": 48, "step_mode": wgpu.VertexStepMode.instance,
+            "array_stride": 64, "step_mode": wgpu.VertexStepMode.instance,
             "attributes": [
                 {"shader_location": 0, "offset": 0, "format": wgpu.VertexFormat.float32x2},
-                {"shader_location": 1, "offset": 8, "format": wgpu.VertexFormat.float32x2}]}]},
+                {"shader_location": 1, "offset": 8, "format": wgpu.VertexFormat.float32x2},
+                {"shader_location": 2, "offset": 48, "format": wgpu.VertexFormat.float32}]}]},
         fragment={"module": mods["WGSL_RENDER"], "entry_point": "fs",
                   "targets": [{"format": wgpu.TextureFormat.bgra8unorm}]},
         primitive={"topology": wgpu.PrimitiveTopology.triangle_list})
@@ -39,7 +40,7 @@ except Exception as e:
 NG = 64; DT = 3.0e-4; GRAV = 25.0
 E, NU = 1200.0, 0.3
 MU = E / (2*(1+NU)); LA = E*NU/((1+NU)*(1-2*NU))
-PS = 12; SUB = 12
+PS = 16; SUB = 12
 
 clear_p = device.create_compute_pipeline(layout="auto", compute={"module": mods["WGSL_CLEAR"], "entry_point": "main"})
 p2g_p = device.create_compute_pipeline(layout="auto", compute={"module": mods["WGSL_P2G"], "entry_point": "main"})
@@ -91,11 +92,13 @@ def run_collapse(phi_deg, frames=250):
     xs = sorted(out[i*PS] for i in range(N))
     ys = sorted(out[i*PS+1] for i in range(N))
     vs = [math.hypot(out[i*PS+2], out[i*PS+3]) for i in range(N)]
+    qs = [out[i*PS+12] for i in range(N)]
     bad = sum(1 for i in range(N) if not (math.isfinite(out[i*PS]) and math.isfinite(out[i*PS+1])))
     ke = sum(v*v for v in vs)/N
     p95h = ys[int(N*0.95)]
     runout = xs[int(N*0.99)] - xs[int(N*0.01)]   # robust extent
     return {"N":N, "bad":bad, "runout":runout, "height":p95h, "ke":ke,
+            "q_mean": sum(qs)/N, "q_max": max(qs),
             "inbox": sum(1 for i in range(N) if 0<=out[i*PS]<=1 and 0<=out[i*PS+1]<=1)}
 
 fails = 0
@@ -117,5 +120,9 @@ check("PHYSICS: low friction runs out farther", lo["runout"] > hi["runout"] + 0.
       f"15deg {lo['runout']:.3f} vs 45deg {hi['runout']:.3f}")
 check("PHYSICS: high friction pile stands taller", hi["height"] > lo["height"] + 0.01,
       f"{hi['height']:.3f} vs {lo['height']:.3f}")
+check("PHYSICS: flow accumulated plastic strain (jamming state)", lo["q_mean"] > 0.02 and lo["q_max"] <= 2.0,
+      f"q mean {lo['q_mean']:.3f} max {lo['q_max']:.3f}")
+check("PHYSICS: low-friction flow hardened more than high-friction", lo["q_mean"] > hi["q_mean"],
+      f"{lo['q_mean']:.3f} vs {hi['q_mean']:.3f}")
 print("\n" + ("ALL TESTS PASS" if fails == 0 else f"{fails} FAILURES"))
 sys.exit(1 if fails else 0)

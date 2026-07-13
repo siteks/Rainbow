@@ -52,6 +52,7 @@
 </head>
 <body>
 <canvas id="gpu"></canvas>
+<canvas id="load" width="220" height="52" style="position:fixed;top:10px;right:10px;z-index:1;opacity:0.85"></canvas>
 <div id="hud">
   <h1>Sand Lab</h1>
   <div class="stats" id="stats">MLS-MPM · Drucker–Prager</div>
@@ -85,7 +86,7 @@ const E_YOUNG = 1200.0, NU = 0.3;
 const MU = E_YOUNG / (2 * (1 + NU));
 const LAMBDA = E_YOUNG * NU / ((1 + NU) * (1 - 2 * NU));
 const FP = 1048576.0;          // fixed-point scale for grid atomics
-const PSTRIDE = 12;            // px,py,vx,vy,C(4),F(4)
+const PSTRIDE = 16;            // px,py,vx,vy,C(4),F(4),q,pad(3)
 
 const gpuCanvas = document.getElementById('gpu');
 const overlay = document.getElementById('overlay');
@@ -150,7 +151,7 @@ const WGSL_P2G = WGSL_COMMON + /* wgsl */`
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= u32(S.c.y)) { return; }
-  let pb = gid.x * 12u;
+  let pb = gid.x * 16u;
   let x = vec2<f32>(P[pb], P[pb + 1u]);
   let v = vec2<f32>(P[pb + 2u], P[pb + 3u]);
   let C = mat2x2<f32>(vec2<f32>(P[pb + 4u], P[pb + 5u]), vec2<f32>(P[pb + 6u], P[pb + 7u]));
@@ -223,6 +224,8 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (gy > n - 4u && v.y > 0.0) { v.y = 0.0; }
     // mild dissipation (inelastic grain collisions, not captured by MPM)
     v *= 0.995;
+    // quasi-static arrest: creeping nodes lock solid
+    if (dot(v, v) < 2.5e-6) { v = vec2<f32>(0.0); }
     // CFL safety clamp
     let vmax = 0.45 * S.a.z / S.a.x;
     let sp = length(v);
@@ -240,7 +243,7 @@ const WGSL_G2P = WGSL_COMMON + /* wgsl */`
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= u32(S.c.y)) { return; }
-  let pb = gid.x * 12u;
+  let pb = gid.x * 16u;
   var x = vec2<f32>(P[pb], P[pb + 1u]);
   var F = mat2x2<f32>(vec2<f32>(P[pb + 8u], P[pb + 9u]), vec2<f32>(P[pb + 10u], P[pb + 11u]));
 
@@ -280,12 +283,17 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let tre = eps.x + eps.y;
   let ehat = eps - vec2<f32>(tre * 0.5);
   let en = length(ehat);
+  // hardening: accumulated plastic strain widens the friction cone (jamming)
+  var q = P[pb + 12u];
+  let alphaEff = S.b.z * (1.0 + 1.6 * min(q, 0.35));
   if (tre > 0.0) {
+    q += en;
     eps = vec2<f32>(0.0);                                   // expanding: stress-free
   } else if (en > 1e-9) {
-    let dg = en + ((S.b.y + S.b.x) / S.b.x) * tre * S.b.z;  // yield amount
-    if (dg > 0.0) { eps = eps - (dg / en) * ehat; }         // project to cone
+    let dg = en + ((S.b.y + S.b.x) / S.b.x) * tre * alphaEff;
+    if (dg > 0.0) { eps = eps - (dg / en) * ehat; q += dg; }
   }
+  P[pb + 12u] = min(q, 2.0);
   let ns = exp(eps);
   Fn = U * mat2x2<f32>(vec2<f32>(ns.x, 0.0), vec2<f32>(0.0, ns.y)) * transpose(V);
 
@@ -306,7 +314,8 @@ struct VOut {
 fn vs(@builtin(vertex_index) vi : u32,
       @builtin(instance_index) ii : u32,
       @location(0) ppos : vec2<f32>,
-      @location(1) pvel : vec2<f32>) -> VOut {
+      @location(1) pvel : vec2<f32>,
+      @location(2) pq : f32) -> VOut {
   var corners = array<vec2<f32>, 6>(
     vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
     vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0));
@@ -322,7 +331,8 @@ fn vs(@builtin(vertex_index) vi : u32,
   else if (band == 3u) { base = vec3<f32>(0.31, 0.66, 1.00); }
   else                 { base = vec3<f32>(0.69, 0.42, 1.00); }
   let sp = clamp(length(pvel) * 1.2, 0.0, 1.0);
-  o.col = base * (0.75 + 0.25 * sp) + vec3<f32>(sp * 0.25);
+  let hard = clamp(pq * 1.4, 0.0, 0.45);                 // compacted sand darkens
+  o.col = base * (0.75 + 0.25 * sp) * (1.0 - hard) + vec3<f32>(sp * 0.25);
   return o;
 }
 
@@ -346,8 +356,15 @@ async function initGPU() {
   if (!navigator.gpu) { fatal('No WebGPU in this browser.'); return false; }
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) { fatal('No WebGPU adapter.'); return false; }
-  device = await adapter.requestDevice();
+  const wantTS = adapter.features.has('timestamp-query');
+  device = await adapter.requestDevice(wantTS ? { requiredFeatures: ['timestamp-query'] } : {});
+  hasTS = wantTS;
   device.addEventListener('uncapturederror', (e) => fatal('GPU error: ' + e.error.message));
+  if (hasTS) {
+    tsQuery = device.createQuerySet({ type: 'timestamp', count: 2 });
+    tsResolve = device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+    tsRead = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  }
   format = navigator.gpu.getPreferredCanvasFormat();
 
   const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
@@ -387,7 +404,8 @@ async function initGPU() {
       stepMode: 'instance',
       attributes: [
         { shaderLocation: 0, offset: 0, format: 'float32x2' },
-        { shaderLocation: 1, offset: 8, format: 'float32x2' }
+        { shaderLocation: 1, offset: 8, format: 'float32x2' },
+        { shaderLocation: 2, offset: 48, format: 'float32' }
       ]
     }] },
     fragment: { module: rmod, entryPoint: 'fs', targets: [{ format }] },
@@ -491,6 +509,31 @@ fricEl.addEventListener('input', () => { phiEl.textContent = fricEl.value + '°'
 
 // ---------------- loop ----------------
 let last = performance.now(), fps = 60, fpsAcc = 0, fpsN = 0, diagFrames = 8;
+const loadCv = document.getElementById('load');
+const loadCtx = loadCv.getContext('2d');
+const frameMs = new Float32Array(110).fill(16.7);
+let fmIdx = 0, gpuMs = null, tsPending = false;
+let tsQuery = null, tsResolve = null, tsRead = null, hasTS = false;
+
+function drawLoad(cpu) {
+  const w = loadCv.width, h = loadCv.height;
+  loadCtx.clearRect(0, 0, w, h);
+  loadCtx.fillStyle = 'rgba(255,255,255,0.05)';
+  loadCtx.fillRect(0, 0, w, h);
+  const scale = h / 33.4;                       // 2 frames tall
+  loadCtx.strokeStyle = 'rgba(255,217,61,0.5)'; // 16.7ms line
+  loadCtx.beginPath(); loadCtx.moveTo(0, h - 16.7 * scale); loadCtx.lineTo(w, h - 16.7 * scale); loadCtx.stroke();
+  loadCtx.fillStyle = 'rgba(120,220,255,0.8)';
+  for (let i = 0; i < frameMs.length; i++) {
+    const v = frameMs[(fmIdx + i) % frameMs.length];
+    const bh = Math.min(h, v * scale);
+    loadCtx.fillRect(i * 2, h - bh, 1.6, bh);
+  }
+  loadCtx.fillStyle = '#b8aede';
+  loadCtx.font = '9px system-ui';
+  loadCtx.textAlign = 'right';
+  loadCtx.fillText(cpu.toFixed(1) + ' ms frame' + (gpuMs !== null ? '  ·  ' + gpuMs.toFixed(1) + ' ms gpu' : ''), w - 4, 9);
+}
 function alphaFromPhi(deg) {
   const s = Math.sin(deg * Math.PI / 180);
   return Math.sqrt(2 / 3) * 2 * s / (3 - s);
@@ -519,9 +562,12 @@ function frame(now) {
     const diag = diagFrames > 0;
     if (diag) { diagFrames--; device.pushErrorScope('validation'); }
     const enc = device.createCommandEncoder();
+    const stampThis = hasTS && !tsPending;
     if (count > 0) {
       for (let s = 0; s < SUBSTEPS; s++) {
-        let cp = enc.beginComputePass();
+        let cp = (s === 0 && stampThis)
+          ? enc.beginComputePass({ timestampWrites: { querySet: tsQuery, beginningOfPassWriteIndex: 0 } })
+          : enc.beginComputePass();
         cp.setPipeline(clearPipe); cp.setBindGroup(0, clearBG);
         cp.dispatchWorkgroups(Math.ceil(NG * NG * 3 / 256)); cp.end();
         cp = enc.beginComputePass();
@@ -536,17 +582,35 @@ function frame(now) {
       }
     }
     const view = ctxGpu.getCurrentTexture().createView();
-    const rp = enc.beginRenderPass({ colorAttachments: [{ view, clearValue: { r: 0.07, g: 0.055, b: 0.13, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+    const rpDesc = { colorAttachments: [{ view, clearValue: { r: 0.07, g: 0.055, b: 0.13, a: 1 }, loadOp: 'clear', storeOp: 'store' }] };
+    if (stampThis && count > 0) rpDesc.timestampWrites = { querySet: tsQuery, endOfPassWriteIndex: 1 };
+    const rp = enc.beginRenderPass(rpDesc);
     if (count > 0) {
       rp.setPipeline(renderPipe);
       rp.setVertexBuffer(0, pBuf);
       rp.draw(6, count);
     }
     rp.end();
+    if (stampThis && count > 0) {
+      enc.resolveQuerySet(tsQuery, 0, 2, tsResolve, 0);
+      enc.copyBufferToBuffer(tsResolve, 0, tsRead, 0, 16);
+    }
     device.queue.submit([enc.finish()]);
     if (diag) { device.popErrorScope().then(e => { if (e) fatal('GPU validation: ' + e.message); }); }
+    if (stampThis && count > 0) {
+      tsPending = true;
+      tsRead.mapAsync(GPUMapMode.READ).then(() => {
+        const t = new BigInt64Array(tsRead.getMappedRange().slice(0));
+        tsRead.unmap();
+        gpuMs = Number(t[1] - t[0]) / 1e6;
+        tsPending = false;
+      }).catch(() => { tsPending = false; });
+    }
 
     statsEl.textContent = count.toLocaleString() + ' material points · ' + SUBSTEPS + ' substeps · ' + fps + ' fps · MLS-MPM / Drucker–Prager';
+    frameMs[fmIdx] = dt * 1000;
+    fmIdx = (fmIdx + 1) % frameMs.length;
+    drawLoad(dt * 1000);
   }
   requestAnimationFrame(frame);
 }
