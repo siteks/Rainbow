@@ -124,8 +124,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     var va = velOf(a);
     let ha = pcg((iA * 2654435761u) ^ P.seed);
     if (c == 0u) {
-      va = min(va + ((ha >> 5u) & 1u), 12u);
-      if (va == 12u && (ha & 15u) == 0u) { va = 11u; }
+      let j = ha & 15u;                                  // small jitter: p=1/16 each way
+      va = min(va + P.gtick + select(0u, 1u, j == 0u), 12u);
+      if (j == 1u && va > 0u) { va = va - 1u; }
+      if (va == 12u && ((ha >> 8u) & 15u) == 0u) { va = 11u; }  // terminal dither
     } else { va = va - min(va, 2u); }
     a = tick(withVel(a, va));
   }
@@ -133,8 +135,10 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     var vb = velOf(b);
     let hb = pcg((iB * 2654435761u) ^ P.seed);
     if (d == 0u) {
-      vb = min(vb + ((hb >> 5u) & 1u), 12u);
-      if (vb == 12u && (hb & 15u) == 0u) { vb = 11u; }
+      let j = hb & 15u;
+      vb = min(vb + P.gtick + select(0u, 1u, j == 0u), 12u);
+      if (j == 1u && vb > 0u) { vb = vb - 1u; }
+      if (vb == 12u && ((hb >> 8u) & 15u) == 0u) { vb = 11u; }
     } else { vb = vb - min(vb, 2u); }
     b = tick(withVel(b, vb));
   }
@@ -164,7 +168,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 `;
 
 const WGSL_SPAWN = WGSL_COMMON + /* wgsl */`
-struct SpawnP { w: u32, h: u32, x: u32, color: u32, count: u32, seed: u32, pad0: u32, pad1: u32 };
+struct SpawnP { w: u32, h: u32, x: u32, color: u32, count: u32, seed: u32, halfw: u32, pad1: u32 };
 @group(0) @binding(0) var<storage, read_write> cells : array<u32>;
 @group(0) @binding(1) var<uniform> S : SpawnP;
 
@@ -173,11 +177,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= S.count) { return; }
   let r1 = pcg((gid.x * 2654435761u) ^ S.seed);
   let r2 = pcg(r1 ^ 0x9e3779b9u);
-  let jx = i32(S.x) + i32(r1 % 41u) - 20;
+  let span = 2u * S.halfw + 1u;
+  let jx = i32(S.x) + i32(r1 % span) - i32(S.halfw);
   if (jx < 0 || jx >= i32(S.w)) { return; }
   let jy = r2 % 5u;
   let i = jy * S.w + u32(jx);
-  if (cells[i] == 0u) { cells[i] = S.color | ((1u + ((r2 >> 8u) % 5u)) << 8u); }
+  if (cells[i] == 0u) { cells[i] = S.color | ((2u + ((r2 >> 8u) & 1u)) << 8u); }
 }
 `;
 
@@ -543,11 +548,12 @@ function frame(now) {
 
     if (phase === 'pour' && pour) {
       pour.age = (pour.age || 0) + dt;
-      const rampUp = Math.min(1, pour.age / 0.30);
-      const rampDown = Math.min(1, pour.remaining / (GRAINS_PER_BLOB * 0.18));
-      const rate = Math.max(0.08, Math.min(rampUp, rampDown));
-      const n = Math.min(Math.max(8, Math.floor(SPAWN_PER_FRAME * rate)), pour.remaining);
-      device.queue.writeBuffer(spawnUni, 0, new Uint32Array([SIMW, SIMH, pour.x, pour.color + 1, n, (Math.random() * 0xffffffff) >>> 0, 0, 0]));
+      const rampUp = Math.min(1, pour.age / 0.35);
+      const rampDown = Math.min(1, pour.remaining / (GRAINS_PER_BLOB * 0.25));
+      const rate = Math.max(0.05, Math.min(rampUp, rampDown));
+      const n = Math.min(Math.max(5, Math.floor(SPAWN_PER_FRAME * rate)), pour.remaining);
+      const halfW = Math.max(1, Math.round(20 * rate));   // spout width rides the flow rate
+      device.queue.writeBuffer(spawnUni, 0, new Uint32Array([SIMW, SIMH, pour.x, pour.color + 1, n, (Math.random() * 0xffffffff) >>> 0, halfW, 0]));
       const sp = enc.beginComputePass();
       sp.setPipeline(spawnPipe);
       sp.setBindGroup(0, spawnBG);

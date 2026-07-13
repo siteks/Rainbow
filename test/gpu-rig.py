@@ -144,6 +144,27 @@ check("topple: tower spread to >= 7 columns", len(heights) >= 7, str(sorted(heig
 check("topple: bottom row grains participated", len(bottom_row) >= 5, str(bottom_row))
 check("topple: max height dropped below 20", max(heights.values()) < 20, str(max(heights.values())))
 
+# ---- 4b. spawn width follows the halfw uniform ----
+spawn_pipe = device.create_compute_pipeline(layout="auto", compute={"module": mods["WGSL_SPAWN"], "entry_point": "main"})
+spawn_uni = device.create_buffer(size=32, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+spawn_bg = device.create_bind_group(layout=spawn_pipe.get_bind_group_layout(0), entries=[
+    {"binding": 0, "resource": {"buffer": cells_buf, "offset": 0, "size": NCELLS * 4}},
+    {"binding": 1, "resource": {"buffer": spawn_uni, "offset": 0, "size": 32}}])
+for halfw, lo, hi in [(1, 1, 3), (20, 25, 41)]:
+    upload(array.array("I", [0] * NCELLS))
+    for rep in range(6):  # several dispatches to fill the span
+        device.queue.write_buffer(spawn_uni, 0, struct.pack("8I", W if False else 84 if False else W, H, W // 2, 2, 64, random.getrandbits(32), halfw, 0))
+        enc = device.create_command_encoder()
+        cp = enc.begin_compute_pass(); cp.set_pipeline(spawn_pipe); cp.set_bind_group(0, spawn_bg)
+        cp.dispatch_workgroups(1); cp.end()
+        device.queue.submit([enc.finish()])
+    data = download()
+    xs = sorted({i % W for i, v in enumerate(data) if v & 0xFF})
+    extent = (xs[-1] - xs[0] + 1) if xs else 0
+    # W=16 clips the wide case; only assert what fits
+    ok = (extent <= hi) and (extent >= min(lo, W))
+    check(f"spawn width halfw={halfw}: extent {extent} within [{min(lo, W)},{hi}]", ok, str(xs))
+
 # ---- 5. tick-flag hygiene: no stuck flags after a frame completes ----
 stuck = sum(1 for v in data if v & 0x1000)
 check("tick flags cleared at frame end", stuck == 0, str(stuck))
