@@ -38,7 +38,7 @@ except Exception as e:
     print("VALIDATE render pipeline: FAIL", e); sys.exit(1)
 
 NG = 64; DT = 4.0e-4; GRAV = 32.0
-E, NU = 1200.0, 0.3
+E, NU = 4800.0, 0.3
 MU = E / (2*(1+NU)); LA = E*NU/((1+NU)*(1-2*NU))
 PS = 16; SUB = 12
 
@@ -75,7 +75,7 @@ def run_collapse(phi_deg, frames=250):
     rho_rest = (1/NG/0.006)**2
     device.queue.write_buffer(uni, 0, struct.pack("20f",
         DT, NG, 1/NG, GRAV,  MU, LA, alpha_from_phi(phi_deg), pmass,
-        0,0,0,0,  0, float(N), NG, pvol,  rho_rest, 0,0,0))
+        0,0,0,0,  0, float(N), NG, pvol,  rho_rest, 0.02,0,0))
     def bg(pipe, bufs):
         return device.create_bind_group(layout=pipe.get_bind_group_layout(0),
             entries=[{"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}} for i, b in enumerate(bufs)])
@@ -131,7 +131,7 @@ def disturb_cycle():
     rho_rest = (1/NG/0.006)**2
     device.queue.write_buffer(uni, 0, struct.pack("20f",
         DT, NG, 1/NG, GRAV, MU, LA, alpha_from_phi(30), 1.0,
-        0,0,0,0, 0, float(N), NG, 0.5, rho_rest, 0,0,0))
+        0,0,0,0, 0, float(N), NG, 0.5, rho_rest, 0.02,0,0))
     def bg(pipe, bufs):
         return device.create_bind_group(layout=pipe.get_bind_group_layout(0),
             entries=[{"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}} for i, b in enumerate(bufs)])
@@ -194,7 +194,7 @@ def stir_test():
         rho_rest = (1/NG/0.006)**2
         device.queue.write_buffer(uni, 0, struct.pack("20f",
             DT, NG, 1/NG, GRAV, MU, LA, alpha_from_phi(20), 1.0,
-            mx, my, mvx, mvy, on, float(N), NG, 0.5, rho_rest, 0,0,0))
+            mx, my, mvx, mvy, on, float(N), NG, 0.5, rho_rest, 0.02,0,0))
     set_uni()
     def bg(pipe, bufs):
         return device.create_bind_group(layout=pipe.get_bind_group_layout(0),
