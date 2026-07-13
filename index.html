@@ -430,15 +430,27 @@
       drawTile(n1X, trayY + ts * 0.08, ts * 0.8, next1);
       drawTile(n1X + ts * 0.85, trayY + ts * 0.18, ts * 0.62, next2, 0.6);
 
-      // timer bar
+      // timer disc: fills clockwise as the turn elapses
       const frac = Math.max(0, timeLeft / turnTime);
-      const barY = gridY - 14;
-      ctx.fillStyle = 'rgba(255,255,255,0.08)';
-      roundRect(gridX, barY, gridW, 6, 3);
+      const elapsedFrac = 1 - frac;
+      const tr = cell * 0.38;
+      const tcx = W / 2 - ts / 2 - tr - 12;
+      const tcy = trayY + ts / 2;
+      ctx.beginPath();
+      ctx.arc(tcx, tcy, tr, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255,255,255,0.06)';
       ctx.fill();
-      ctx.fillStyle = frac > 0.35 ? '#4ecb71' : '#ff5a5f';
-      roundRect(gridX, barY, gridW * frac, 6, 3);
-      ctx.fill();
+      ctx.strokeStyle = 'rgba(124,111,174,0.35)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      if (elapsedFrac > 0 && phase !== 'fanfare') {
+        ctx.beginPath();
+        ctx.moveTo(tcx, tcy);
+        ctx.arc(tcx, tcy, tr, -Math.PI / 2, -Math.PI / 2 + elapsedFrac * Math.PI * 2);
+        ctx.closePath();
+        ctx.fillStyle = frac > 0.35 ? 'rgba(124,111,174,0.55)' : 'rgba(255,90,95,0.85)';
+        ctx.fill();
+      }
 
       // grid background
       for (let r = 0; r < N; r++) {
