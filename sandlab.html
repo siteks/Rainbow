@@ -80,8 +80,8 @@
 const NG = 100;                // grid nodes per side
 const MAXP = 60000;
 const SUBSTEPS = 12;
-const DT = 3.0e-4;
-const GRAV = 25.0;
+const DT = 4.0e-4;
+const GRAV = 32.0;
 const E_YOUNG = 1200.0, NU = 0.3;
 const MU = E_YOUNG / (2 * (1 + NU));
 const LAMBDA = E_YOUNG * NU / ((1 + NU) * (1 - 2 * NU));
@@ -337,8 +337,9 @@ fn vs(@builtin(vertex_index) vi : u32,
   else if (band == 3u) { base = vec3<f32>(0.31, 0.66, 1.00); }
   else                 { base = vec3<f32>(0.69, 0.42, 1.00); }
   let sp = clamp(length(pvel) * 1.2, 0.0, 1.0);
-  let hard = clamp(pq * 1.4, 0.0, 0.45);                 // compacted sand darkens
-  o.col = base * (0.75 + 0.25 * sp) * (1.0 - hard) + vec3<f32>(sp * 0.25);
+  let hard = clamp(pq * 1.6, 0.0, 0.75);                 // locked sand shifts to sandstone
+  let lockedCol = vec3<f32>(0.87, 0.76, 0.54);
+  o.col = mix(base * (0.75 + 0.25 * sp), lockedCol, hard) + vec3<f32>(sp * 0.25);
   return o;
 }
 
@@ -538,7 +539,7 @@ function drawLoad(cpu) {
   loadCtx.fillStyle = '#b8aede';
   loadCtx.font = '9px system-ui';
   loadCtx.textAlign = 'right';
-  loadCtx.fillText(cpu.toFixed(1) + ' ms frame' + (gpuMs !== null ? '  ·  ' + gpuMs.toFixed(1) + ' ms gpu' : ''), w - 4, 9);
+  loadCtx.fillText(cpu.toFixed(1) + ' ms frame' + (gpuMs !== null ? '  ·  gpu use ' + gpuMs.toFixed(1) + ' ms' : ''), w - 4, 9);
 }
 function alphaFromPhi(deg) {
   const s = Math.sin(deg * Math.PI / 180);

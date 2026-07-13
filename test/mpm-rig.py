@@ -37,7 +37,7 @@ try:
 except Exception as e:
     print("VALIDATE render pipeline: FAIL", e); sys.exit(1)
 
-NG = 64; DT = 3.0e-4; GRAV = 25.0
+NG = 64; DT = 4.0e-4; GRAV = 32.0
 E, NU = 1200.0, 0.3
 MU = E / (2*(1+NU)); LA = E*NU/((1+NU)*(1-2*NU))
 PS = 16; SUB = 12
