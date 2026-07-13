@@ -110,6 +110,8 @@
   let floats = [], confetti = [], debris = [], shakeX = 0;
   let timeLeft = 6, turnTime = 6;
   let round = 1, runsCleared = 0, roundGoal = 5, fanfareT = 0;
+  let dealT = 0, praise = '', fanfarePraised = false;
+  const PRAISE = ['Well done!', 'Brilliant!', 'Splendid!', 'Nice one!', 'Superb!', 'Lovely stuff!'];
 
   function drawBag() {
     if (!bag || bag.length === 0) {
@@ -153,7 +155,8 @@
     seedBoard();
     chain = 0;
     newTurn();
-    phase = 'idle';
+    dealT = 0;
+    phase = 'dealin';
   }
 
   function reset() {
@@ -259,6 +262,8 @@
       if (runsCleared >= roundGoal) {
         phase = 'fanfare';
         fanfareT = 0;
+        fanfarePraised = false;
+        praise = PRAISE[Math.floor(Math.random() * PRAISE.length)];
         burstConfetti();
         addFloat('ROUND ' + round + ' CLEAR!', W / 2, H * 0.5, '#ffd93d');
       } else if (board.every(row => row.every(v => v !== null))) {
@@ -461,11 +466,21 @@
         }
       }
 
-      // placed tiles
+      // placed tiles (dealt in with a stagger at round start)
       for (let r = 0; r < N; r++)
         for (let c = 0; c < N; c++)
-          if (board[r][c] !== null)
-            drawTile(gridX + c * cell, gridY + r * cell, cell, board[r][c]);
+          if (board[r][c] !== null) {
+            if (phase === 'dealin') {
+              const delay = c * 0.04 + (N - 1 - r) * 0.06;
+              const prog = Math.min(1, Math.max(0, (dealT - delay) * 5));
+              if (prog <= 0) continue;
+              const eased = 1 - (1 - prog) * (1 - prog);
+              const y = gridY + r * cell - (1 - eased) * cell * 3;
+              drawTile(gridX + c * cell, y, cell, board[r][c], prog);
+            } else {
+              drawTile(gridX + c * cell, gridY + r * cell, cell, board[r][c]);
+            }
+          }
 
       // drop animation
       if (phase === 'drop' && dropAnim) {
@@ -495,7 +510,42 @@
       // fanfare between rounds
       if (phase === 'fanfare') {
         fanfareT += dt;
-        if (fanfareT > 1.7) startRound(round + 1);
+        if (fanfareT > 0.85) {
+          if (!fanfarePraised) { fanfarePraised = true; burstConfetti(); }
+          const t = Math.min(1, (fanfareT - 0.85) * 4);
+          const pop = 1 + 0.18 * Math.sin(t * Math.PI);
+          ctx.save();
+          ctx.translate(W / 2, H * 0.44);
+          ctx.scale(pop, pop);
+          ctx.globalAlpha = t;
+          ctx.fillStyle = '#ffffff';
+          ctx.font = '800 36px system-ui';
+          ctx.textAlign = 'center';
+          ctx.fillText(praise, 0, 0);
+          ctx.globalAlpha = t * 0.8;
+          ctx.fillStyle = '#b8aede';
+          ctx.font = '600 14px system-ui';
+          ctx.fillText('Get ready for round ' + (round + 1), 0, 30);
+          ctx.restore();
+          ctx.globalAlpha = 1;
+        }
+        if (fanfareT > 2.6) startRound(round + 1);
+      }
+
+      // new-round deal-in
+      if (phase === 'dealin') {
+        dealT += dt;
+        const hasTiles = board.some(row => row.some(v => v !== null));
+        const bannerA = Math.max(0, Math.min(1, dealT * 4) - Math.max(0, (dealT - 0.9) * 2.5));
+        if (bannerA > 0) {
+          ctx.globalAlpha = bannerA;
+          ctx.fillStyle = '#ffd93d';
+          ctx.font = '800 28px system-ui';
+          ctx.textAlign = 'center';
+          ctx.fillText('ROUND ' + round, W / 2, gridY - 30);
+          ctx.globalAlpha = 1;
+        }
+        if (dealT > (hasTiles ? 1.15 : 0.8)) { newTurn(); phase = 'idle'; }
       }
 
       // open-column hints
