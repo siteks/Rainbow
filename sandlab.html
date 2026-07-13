@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Sand Lab — MLS-MPM</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%; overflow: hidden; background: #1a1430;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+    font-family: 'Segoe UI', system-ui, sans-serif; color: #f4f0ff;
+  }
+  #gpu { position: fixed; left: 0; z-index: 0; }
+  #hud {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 1;
+    text-align: center; padding-top: 12px; pointer-events: none;
+  }
+  #hud h1 { font-size: 19px; font-weight: 700; letter-spacing: 1px; }
+  #hud .stats { font-size: 10.5px; color: #7c6fae; margin-top: 3px; }
+  #controls {
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 1;
+    padding: 10px 14px calc(14px + env(safe-area-inset-bottom));
+    background: linear-gradient(transparent, rgba(26,20,48,0.92) 30%);
+  }
+  .row { display: flex; gap: 8px; justify-content: center; align-items: center; margin-top: 8px; }
+  button {
+    background: rgba(255,255,255,0.08); color: #f4f0ff;
+    border: 1px solid rgba(124,111,174,0.5); border-radius: 10px;
+    padding: 8px 14px; font-size: 13px; font-family: inherit;
+  }
+  button:active { background: rgba(255,255,255,0.18); }
+  label { font-size: 11px; color: #b8aede; }
+  input[type=range] { width: 46vw; accent-color: #ffd93d; }
+  #phi { color: #ffd93d; font-variant-numeric: tabular-nums; }
+  #overlay {
+    position: fixed; inset: 0; z-index: 2;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; background: rgba(26,20,48,0.75); backdrop-filter: blur(4px);
+    transition: opacity 0.25s; padding: 24px;
+  }
+  #overlay.hidden { opacity: 0; pointer-events: none; }
+  #overlay h1 {
+    font-size: 34px; font-weight: 800;
+    background: linear-gradient(90deg,#ff5a5f,#ffd93d,#4ecb71,#4ea8ff,#b06cff);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  #overlay p { margin-top: 14px; font-size: 14px; color: #b8aede; max-width: 320px; line-height: 1.65; }
+  #overlay .err { margin-top: 12px; font-size: 12px; color: #ff5a5f; max-width: 330px; word-break: break-word; }
+  #overlay .tap { margin-top: 28px; font-size: 11px; letter-spacing: 4px; text-transform: uppercase; color: #7c6fae; }
+</style>
+</head>
+<body>
+<canvas id="gpu"></canvas>
+<div id="hud">
+  <h1>Sand Lab</h1>
+  <div class="stats" id="stats">MLS-MPM · Drucker–Prager</div>
+</div>
+<div id="controls">
+  <div class="row">
+    <label>friction φ <span id="phi">35°</span></label>
+    <input type="range" id="fric" min="10" max="45" value="35">
+  </div>
+  <div class="row">
+    <button id="bCol">Column</button>
+    <button id="bDam">Dam break</button>
+    <button id="bRain">Rain</button>
+    <button id="bClear">Clear</button>
+  </div>
+</div>
+<div id="overlay">
+  <h1>Sand Lab</h1>
+  <p>Real granular physics: the material point method with Drucker–Prager plasticity, run entirely in compute shaders. Drop a column and watch it collapse; drag the friction slider and the pile changes character. Touch pours sand, flicking shoves it.</p>
+  <div class="err" id="err"></div>
+  <div class="tap" id="tapmsg">Checking WebGPU…</div>
+</div>
+
+<script type="module">
+const NG = 100;                // grid nodes per side
+const MAXP = 60000;
+const SUBSTEPS = 12;
+const DT = 3.0e-4;
+const GRAV = 25.0;
+const E_YOUNG = 1200.0, NU = 0.3;
+const MU = E_YOUNG / (2 * (1 + NU));
+const LAMBDA = E_YOUNG * NU / ((1 + NU) * (1 - 2 * NU));
+const FP = 1048576.0;          // fixed-point scale for grid atomics
+const PSTRIDE = 12;            // px,py,vx,vy,C(4),F(4)
+
+const gpuCanvas = document.getElementById('gpu');
+const overlay = document.getElementById('overlay');
+const errEl = document.getElementById('err');
+const tapEl = document.getElementById('tapmsg');
+const statsEl = document.getElementById('stats');
+const fricEl = document.getElementById('fric');
+const phiEl = document.getElementById('phi');
+
+function fatal(t) { errEl.textContent = t; tapEl.textContent = 'WebGPU unavailable'; overlay.classList.remove('hidden'); }
+
+const WGSL_COMMON = /* wgsl */`
+struct Sim {
+  a : vec4<f32>,  // dt, invdx, dx, gravity
+  b : vec4<f32>,  // mu, lambda, alpha(DP), pmass
+  m : vec4<f32>,  // mouse x, y, vx, vy   (sim coords)
+  c : vec4<f32>,  // mouseOn, count, ngrid, pvol
+};
+
+// analytic 2x2 SVD: F = U * diag(sig) * V^T (rotations; sig.y may need sign fix)
+fn svd2(F : mat2x2<f32>, U : ptr<function, mat2x2<f32>>, sig : ptr<function, vec2<f32>>, V : ptr<function, mat2x2<f32>>) {
+  let a = F[0][0]; let b2 = F[1][0];   // column-major: F[col][row]
+  let c2 = F[0][1]; let d = F[1][1];
+  let ee = (a + d) * 0.5;
+  let ff = (a - d) * 0.5;
+  let gg = (c2 + b2) * 0.5;
+  let hh = (c2 - b2) * 0.5;
+  let q = sqrt(ee * ee + hh * hh);
+  let r = sqrt(ff * ff + gg * gg);
+  var sx = q + r;
+  var sy = q - r;
+  let a1 = atan2(gg, ff);
+  let a2 = atan2(hh, ee);
+  let th = (a1 - a2) * 0.5;
+  let ph = (a1 + a2) * 0.5;
+  let cph = cos(ph); let sph = sin(ph);
+  let cth = cos(th); let sth = sin(th);
+  (*U) = mat2x2<f32>(vec2<f32>(cph, sph), vec2<f32>(-sph, cph));
+  var Vm = mat2x2<f32>(vec2<f32>(cth, sth), vec2<f32>(-sth, cth));
+  if (sy < 0.0) {                       // absorb sign into V's second column
+    sy = -sy;
+    Vm[1] = -Vm[1];
+  }
+  (*V) = Vm;
+  (*sig) = vec2<f32>(sx, sy);
+}
+`;
+
+const WGSL_CLEAR = /* wgsl */`
+@group(0) @binding(0) var<storage, read_write> GA : array<atomic<i32>>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x < arrayLength(&GA)) { atomicStore(&GA[gid.x], 0); }
+}
+`;
+
+const WGSL_P2G = WGSL_COMMON + /* wgsl */`
+@group(0) @binding(0) var<storage, read_write> P : array<f32>;
+@group(0) @binding(1) var<storage, read_write> GA : array<atomic<i32>>;
+@group(0) @binding(2) var<uniform> S : Sim;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= u32(S.c.y)) { return; }
+  let pb = gid.x * 12u;
+  let x = vec2<f32>(P[pb], P[pb + 1u]);
+  let v = vec2<f32>(P[pb + 2u], P[pb + 3u]);
+  let C = mat2x2<f32>(vec2<f32>(P[pb + 4u], P[pb + 5u]), vec2<f32>(P[pb + 6u], P[pb + 7u]));
+  let F = mat2x2<f32>(vec2<f32>(P[pb + 8u], P[pb + 9u]), vec2<f32>(P[pb + 10u], P[pb + 11u]));
+
+  // Kirchhoff stress from Hencky strain in the principal frame
+  var U : mat2x2<f32>; var sig : vec2<f32>; var V : mat2x2<f32>;
+  svd2(F, &U, &sig, &V);
+  let eps = log(clamp(sig, vec2<f32>(0.05), vec2<f32>(4.0)));
+  let tre = eps.x + eps.y;
+  let tp = 2.0 * S.b.x * eps + vec2<f32>(S.b.y * tre);
+  let tau = U * mat2x2<f32>(vec2<f32>(tp.x, 0.0), vec2<f32>(0.0, tp.y)) * transpose(U);
+  let sfac = -S.a.x * S.c.w * 4.0 * S.a.y * S.a.y;
+  let affine = mat2x2<f32>(sfac * tau[0], sfac * tau[1]) + mat2x2<f32>(S.b.w * C[0], S.b.w * C[1]);
+
+  let n = u32(S.c.z);
+  let Xi = x * S.a.y;
+  let base = floor(Xi - 0.5);
+  let fx = Xi - base;
+  var wx = array<vec2<f32>, 3>(
+    0.5 * (1.5 - fx) * (1.5 - fx),
+    0.75 - (fx - 1.0) * (fx - 1.0),
+    0.5 * (fx - 0.5) * (fx - 0.5));
+  for (var i = 0u; i < 3u; i++) {
+    for (var j = 0u; j < 3u; j++) {
+      let gx = i32(base.x) + i32(i);
+      let gy = i32(base.y) + i32(j);
+      if (gx < 0 || gy < 0 || gx >= i32(n) || gy >= i32(n)) { continue; }
+      let dpos = (vec2<f32>(f32(i), f32(j)) - fx) * S.a.z;
+      let w = wx[i].x * wx[j].y;
+      let mv = w * (S.b.w * v + affine * dpos);
+      let node = (u32(gy) * n + u32(gx)) * 3u;
+      atomicAdd(&GA[node],      i32(mv.x * 1048576.0));
+      atomicAdd(&GA[node + 1u], i32(mv.y * 1048576.0));
+      atomicAdd(&GA[node + 2u], i32(w * S.b.w * 1048576.0));
+    }
+  }
+}
+`;
+
+const WGSL_GRID = WGSL_COMMON + /* wgsl */`
+@group(0) @binding(0) var<storage, read_write> GA : array<atomic<i32>>;
+@group(0) @binding(1) var<storage, read_write> GV : array<vec2<f32>>;
+@group(0) @binding(2) var<uniform> S : Sim;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let n = u32(S.c.z);
+  if (gid.x >= n * n) { return; }
+  let i3 = gid.x * 3u;
+  let m = f32(atomicLoad(&GA[i3 + 2u])) / 1048576.0;
+  var v = vec2<f32>(0.0);
+  if (m > 1e-10) {
+    v = vec2<f32>(f32(atomicLoad(&GA[i3])), f32(atomicLoad(&GA[i3 + 1u]))) / (1048576.0 * m);
+    v.y -= S.a.x * S.a.w;          // gravity
+    // mouse shove: radial impulse around the touch point
+    if (S.c.x > 0.5) {
+      let np = vec2<f32>(f32(gid.x % n), f32(gid.x / n)) * S.a.z;
+      let dm = np - S.m.xy;
+      let r2 = dot(dm, dm);
+      if (r2 < 0.01) {
+        v += S.m.zw * (1.0 - r2 / 0.01) * 0.35;
+      }
+    }
+    // boundaries: side walls and floor separate; ceiling open
+    let gx = gid.x % n; let gy = gid.x / n;
+    if (gx < 3u && v.x < 0.0) { v.x = 0.0; }
+    if (gx > n - 4u && v.x > 0.0) { v.x = 0.0; }
+    if (gy < 3u && v.y < 0.0) { v.y = 0.0; v.x *= 0.75; }   // floor friction
+    if (gy > n - 4u && v.y > 0.0) { v.y = 0.0; }
+    // mild dissipation (inelastic grain collisions, not captured by MPM)
+    v *= 0.995;
+    // CFL safety clamp
+    let vmax = 0.45 * S.a.z / S.a.x;
+    let sp = length(v);
+    if (sp > vmax) { v *= vmax / sp; }
+  }
+  GV[gid.x] = v;
+}
+`;
+
+const WGSL_G2P = WGSL_COMMON + /* wgsl */`
+@group(0) @binding(0) var<storage, read_write> P : array<f32>;
+@group(0) @binding(1) var<storage, read_write> GV : array<vec2<f32>>;
+@group(0) @binding(2) var<uniform> S : Sim;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= u32(S.c.y)) { return; }
+  let pb = gid.x * 12u;
+  var x = vec2<f32>(P[pb], P[pb + 1u]);
+  var F = mat2x2<f32>(vec2<f32>(P[pb + 8u], P[pb + 9u]), vec2<f32>(P[pb + 10u], P[pb + 11u]));
+
+  let n = u32(S.c.z);
+  let Xi = x * S.a.y;
+  let base = floor(Xi - 0.5);
+  let fx = Xi - base;
+  var wx = array<vec2<f32>, 3>(
+    0.5 * (1.5 - fx) * (1.5 - fx),
+    0.75 - (fx - 1.0) * (fx - 1.0),
+    0.5 * (fx - 0.5) * (fx - 0.5));
+  var nv = vec2<f32>(0.0);
+  var B = mat2x2<f32>(vec2<f32>(0.0), vec2<f32>(0.0));
+  for (var i = 0u; i < 3u; i++) {
+    for (var j = 0u; j < 3u; j++) {
+      let gx = i32(base.x) + i32(i);
+      let gy = i32(base.y) + i32(j);
+      if (gx < 0 || gy < 0 || gx >= i32(n) || gy >= i32(n)) { continue; }
+      let dpos = vec2<f32>(f32(i), f32(j)) - fx;     // grid units, matches C scale
+      let w = wx[i].x * wx[j].y;
+      let gv = GV[u32(gy) * n + u32(gx)];
+      nv += w * gv;
+      B += mat2x2<f32>(w * gv * dpos.x, w * gv * dpos.y);
+    }
+  }
+  let C = mat2x2<f32>(4.0 * S.a.y * B[0], 4.0 * S.a.y * B[1]);
+  x += S.a.x * nv;
+  let lo = 2.5 * S.a.z;
+  x = clamp(x, vec2<f32>(lo), vec2<f32>(1.0 - lo));
+
+  // deformation update then Drucker-Prager return mapping
+  let dtC = mat2x2<f32>(S.a.x * C[0], S.a.x * C[1]);
+  var Fn = (mat2x2<f32>(vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0)) + dtC) * F;
+  var U : mat2x2<f32>; var sig : vec2<f32>; var V : mat2x2<f32>;
+  svd2(Fn, &U, &sig, &V);
+  var eps = log(clamp(sig, vec2<f32>(0.05), vec2<f32>(4.0)));
+  let tre = eps.x + eps.y;
+  let ehat = eps - vec2<f32>(tre * 0.5);
+  let en = length(ehat);
+  if (tre > 0.0) {
+    eps = vec2<f32>(0.0);                                   // expanding: stress-free
+  } else if (en > 1e-9) {
+    let dg = en + ((S.b.y + S.b.x) / S.b.x) * tre * S.b.z;  // yield amount
+    if (dg > 0.0) { eps = eps - (dg / en) * ehat; }         // project to cone
+  }
+  let ns = exp(eps);
+  Fn = U * mat2x2<f32>(vec2<f32>(ns.x, 0.0), vec2<f32>(0.0, ns.y)) * transpose(V);
+
+  P[pb] = x.x; P[pb + 1u] = x.y;
+  P[pb + 2u] = nv.x; P[pb + 3u] = nv.y;
+  P[pb + 4u] = C[0].x; P[pb + 5u] = C[0].y; P[pb + 6u] = C[1].x; P[pb + 7u] = C[1].y;
+  P[pb + 8u] = Fn[0].x; P[pb + 9u] = Fn[0].y; P[pb + 10u] = Fn[1].x; P[pb + 11u] = Fn[1].y;
+}
+`;
+
+const WGSL_RENDER = /* wgsl */`
+struct Sim {
+  a : vec4<f32>, b : vec4<f32>, m : vec4<f32>, c : vec4<f32>,
+};
+@group(0) @binding(0) var<storage, read> P : array<f32>;
+@group(0) @binding(1) var<uniform> S : Sim;
+
+struct VOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) col : vec3<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VOut {
+  var corners = array<vec2<f32>, 6>(
+    vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+    vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0));
+  let pb = ii * 12u;
+  let x = vec2<f32>(P[pb], P[pb + 1u]);
+  let v = vec2<f32>(P[pb + 2u], P[pb + 3u]);
+  var o : VOut;
+  let half = vec2<f32>(0.0016, 0.0016);
+  let ndc = x * 2.0 - vec2<f32>(1.0);
+  o.pos = vec4<f32>(ndc + corners[vi] * half * 2.0, 0.0, 1.0);
+  // strata bands by particle id, warmed by speed
+  let band = (ii / 6000u) % 5u;
+  var base : vec3<f32>;
+  if (band == 0u)      { base = vec3<f32>(1.00, 0.35, 0.37); }
+  else if (band == 1u) { base = vec3<f32>(1.00, 0.85, 0.24); }
+  else if (band == 2u) { base = vec3<f32>(0.31, 0.80, 0.44); }
+  else if (band == 3u) { base = vec3<f32>(0.31, 0.66, 1.00); }
+  else                 { base = vec3<f32>(0.69, 0.42, 1.00); }
+  let sp = clamp(length(v) * 1.2, 0.0, 1.0);
+  o.col = base * (0.75 + 0.25 * sp) + vec3<f32>(sp * 0.25);
+  return o;
+}
+
+@fragment
+fn fs(in : VOut) -> @location(0) vec4<f32> {
+  return vec4<f32>(in.col, 1.0);
+}
+`;
+
+// ---------------- init ----------------
+let device, ctxGpu, format;
+let pBuf, gaBuf, gvBuf, simUni;
+let clearPipe, p2gPipe, gridPipe, g2pPipe, renderPipe;
+let clearBG, p2gBG, gridBG, g2pBG, renderBG;
+let count = 0;
+let W, H, side, topY;
+let mouse = { on: 0, x: 0.5, y: 0.5, vx: 0, vy: 0, lastX: 0, lastY: 0, pouring: false };
+let phase = 'boot';
+
+async function initGPU() {
+  if (!navigator.gpu) { fatal('No WebGPU in this browser.'); return false; }
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) { fatal('No WebGPU adapter.'); return false; }
+  device = await adapter.requestDevice();
+  device.addEventListener('uncapturederror', (e) => fatal('GPU error: ' + e.error.message));
+  format = navigator.gpu.getPreferredCanvasFormat();
+
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  W = window.innerWidth; H = window.innerHeight;
+  side = Math.min(W, H * 0.72);
+  topY = Math.max(54, (H - side) * 0.35);
+  gpuCanvas.style.left = ((W - side) / 2) + 'px';
+  gpuCanvas.style.top = topY + 'px';
+  gpuCanvas.style.width = side + 'px';
+  gpuCanvas.style.height = side + 'px';
+  gpuCanvas.width = Math.floor(side * dpr);
+  gpuCanvas.height = Math.floor(side * dpr);
+  ctxGpu = gpuCanvas.getContext('webgpu');
+  ctxGpu.configure({ device, format, alphaMode: 'opaque' });
+
+  pBuf = device.createBuffer({ size: MAXP * PSTRIDE * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  gaBuf = device.createBuffer({ size: NG * NG * 3 * 4, usage: GPUBufferUsage.STORAGE });
+  gvBuf = device.createBuffer({ size: NG * NG * 8, usage: GPUBufferUsage.STORAGE });
+  simUni = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  async function mk(code, entry) {
+    const mod = device.createShaderModule({ code });
+    const info = await mod.getCompilationInfo();
+    const errs = info.messages.filter(m => m.type === 'error');
+    if (errs.length) { fatal('WGSL: ' + errs.map(m => m.lineNum + ':' + m.linePos + ' ' + m.message).join(' | ')); throw new Error('wgsl'); }
+    return mod;
+  }
+  clearPipe = await device.createComputePipelineAsync({ layout: 'auto', compute: { module: await mk(WGSL_CLEAR), entryPoint: 'main' } });
+  p2gPipe = await device.createComputePipelineAsync({ layout: 'auto', compute: { module: await mk(WGSL_P2G), entryPoint: 'main' } });
+  gridPipe = await device.createComputePipelineAsync({ layout: 'auto', compute: { module: await mk(WGSL_GRID), entryPoint: 'main' } });
+  g2pPipe = await device.createComputePipelineAsync({ layout: 'auto', compute: { module: await mk(WGSL_G2P), entryPoint: 'main' } });
+  const rmod = await mk(WGSL_RENDER);
+  renderPipe = await device.createRenderPipelineAsync({
+    layout: 'auto',
+    vertex: { module: rmod, entryPoint: 'vs' },
+    fragment: { module: rmod, entryPoint: 'fs', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' }
+  });
+
+  clearBG = device.createBindGroup({ layout: clearPipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: gaBuf } }] });
+  p2gBG = device.createBindGroup({ layout: p2gPipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: pBuf } }, { binding: 1, resource: { buffer: gaBuf } },
+    { binding: 2, resource: { buffer: simUni } }] });
+  gridBG = device.createBindGroup({ layout: gridPipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: gaBuf } }, { binding: 1, resource: { buffer: gvBuf } },
+    { binding: 2, resource: { buffer: simUni } }] });
+  g2pBG = device.createBindGroup({ layout: g2pPipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: pBuf } }, { binding: 1, resource: { buffer: gvBuf } },
+    { binding: 2, resource: { buffer: simUni } }] });
+  renderBG = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: pBuf } }, { binding: 1, resource: { buffer: simUni } }] });
+
+  tapEl.textContent = 'Tap to begin';
+  return true;
+}
+
+// ---------------- particle seeding ----------------
+function makeParticles(gen) {
+  const arr = [];
+  gen(arr);
+  count = Math.min(MAXP, arr.length);
+  const data = new Float32Array(count * PSTRIDE);
+  for (let i = 0; i < count; i++) {
+    const [x, y] = arr[i];
+    const b = i * PSTRIDE;
+    data[b] = x; data[b + 1] = y;
+    data[b + 8] = 1; data[b + 11] = 1;    // F = identity
+  }
+  device.queue.writeBuffer(pBuf, 0, data);
+}
+const jitter = () => (Math.random() - 0.5) * 0.004;
+function presetColumn() {
+  makeParticles(a => {
+    for (let y = 0.035; y < 0.72; y += 0.0042)
+      for (let x = 0.42; x < 0.58; x += 0.0042)
+        a.push([x + jitter(), y + jitter()]);
+  });
+}
+function presetDam() {
+  makeParticles(a => {
+    for (let y = 0.035; y < 0.55; y += 0.0042)
+      for (let x = 0.035; x < 0.38; x += 0.0042)
+        a.push([x + jitter(), y + jitter()]);
+  });
+}
+function presetRain() {
+  makeParticles(a => {
+    for (let i = 0; i < 22000; i++)
+      a.push([0.05 + Math.random() * 0.9, 0.45 + Math.random() * 0.5]);
+  });
+}
+function pourAt(x) {
+  if (count >= MAXP - 400) return;
+  const n = 350;
+  const data = new Float32Array(n * PSTRIDE);
+  for (let i = 0; i < n; i++) {
+    const b = i * PSTRIDE;
+    data[b] = Math.min(0.96, Math.max(0.04, x + (Math.random() - 0.5) * 0.05));
+    data[b + 1] = 0.90 + Math.random() * 0.06;
+    data[b + 3] = -0.4;
+    data[b + 8] = 1; data[b + 11] = 1;
+  }
+  device.queue.writeBuffer(pBuf, count * PSTRIDE * 4, data);
+  count += n;
+}
+
+// ---------------- input ----------------
+function simCoords(e) {
+  const r = gpuCanvas.getBoundingClientRect();
+  return [(e.clientX - r.left) / r.width, 1 - (e.clientY - r.top) / r.height];
+}
+window.addEventListener('pointerdown', (e) => {
+  if (phase === 'boot') return;
+  if (phase === 'menu') { overlay.classList.add('hidden'); phase = 'run'; presetColumn(); return; }
+  if (e.target.closest('#controls')) return;
+  const [x, y] = simCoords(e);
+  if (x < -0.05 || x > 1.05 || y < -0.05 || y > 1.05) return;
+  mouse.on = 1; mouse.x = x; mouse.y = y; mouse.lastX = x; mouse.lastY = y;
+  mouse.vx = 0; mouse.vy = 0;
+  mouse.pouring = y > 0.75;
+});
+window.addEventListener('pointermove', (e) => {
+  if (!mouse.on) return;
+  const [x, y] = simCoords(e);
+  mouse.vx = (x - mouse.lastX) * 30; mouse.vy = (y - mouse.lastY) * 30;
+  mouse.lastX = x; mouse.lastY = y;
+  mouse.x = x; mouse.y = y;
+  if (Math.hypot(mouse.vx, mouse.vy) > 0.15) mouse.pouring = false;
+});
+window.addEventListener('pointerup', () => { mouse.on = 0; });
+document.getElementById('bCol').addEventListener('click', presetColumn);
+document.getElementById('bDam').addEventListener('click', presetDam);
+document.getElementById('bRain').addEventListener('click', presetRain);
+document.getElementById('bClear').addEventListener('click', () => { count = 0; });
+fricEl.addEventListener('input', () => { phiEl.textContent = fricEl.value + '°'; });
+
+// ---------------- loop ----------------
+let last = performance.now(), fps = 60, fpsAcc = 0, fpsN = 0;
+function alphaFromPhi(deg) {
+  const s = Math.sin(deg * Math.PI / 180);
+  return Math.sqrt(2 / 3) * 2 * s / (3 - s);
+}
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  fpsAcc += dt; fpsN++;
+  if (fpsAcc > 0.5) { fps = Math.round(fpsN / fpsAcc); fpsAcc = 0; fpsN = 0; }
+
+  if (device && phase === 'run') {
+    if (mouse.on && mouse.pouring) pourAt(mouse.x);
+
+    const alpha = alphaFromPhi(parseFloat(fricEl.value));
+    // mass-normalized units: p_mass = 1 so fixed-point grid atomics keep
+    // momentum precision; accelerations are invariant under joint scaling
+    const pmass = 1.0;
+    const pvol = 0.5;   // (dx/2)^2 * rho-scaling folded out: pvol/pmass = 1/rho = 0.5
+    device.queue.writeBuffer(simUni, 0, new Float32Array([
+      DT, NG, 1 / NG, GRAV,
+      MU, LAMBDA, alpha, pmass,
+      mouse.x, mouse.y, mouse.vx, mouse.vy,
+      (mouse.on && !mouse.pouring) ? 1 : 0, count, NG, pvol
+    ]));
+
+    const enc = device.createCommandEncoder();
+    if (count > 0) {
+      for (let s = 0; s < SUBSTEPS; s++) {
+        let cp = enc.beginComputePass();
+        cp.setPipeline(clearPipe); cp.setBindGroup(0, clearBG);
+        cp.dispatchWorkgroups(Math.ceil(NG * NG * 3 / 256)); cp.end();
+        cp = enc.beginComputePass();
+        cp.setPipeline(p2gPipe); cp.setBindGroup(0, p2gBG);
+        cp.dispatchWorkgroups(Math.ceil(count / 64)); cp.end();
+        cp = enc.beginComputePass();
+        cp.setPipeline(gridPipe); cp.setBindGroup(0, gridBG);
+        cp.dispatchWorkgroups(Math.ceil(NG * NG / 64)); cp.end();
+        cp = enc.beginComputePass();
+        cp.setPipeline(g2pPipe); cp.setBindGroup(0, g2pBG);
+        cp.dispatchWorkgroups(Math.ceil(count / 64)); cp.end();
+      }
+    }
+    const view = ctxGpu.getCurrentTexture().createView();
+    const rp = enc.beginRenderPass({ colorAttachments: [{ view, clearValue: { r: 0.07, g: 0.055, b: 0.13, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
+    if (count > 0) {
+      rp.setPipeline(renderPipe);
+      rp.setBindGroup(0, renderBG);
+      rp.draw(6, count);
+    }
+    rp.end();
+    device.queue.submit([enc.finish()]);
+
+    statsEl.textContent = count.toLocaleString() + ' material points · ' + SUBSTEPS + ' substeps · ' + fps + ' fps · MLS-MPM / Drucker–Prager';
+  }
+  requestAnimationFrame(frame);
+}
+initGPU().then(ok => { if (ok) { phase = 'menu'; requestAnimationFrame(frame); } });
+</script>
+</body>
+</html>
