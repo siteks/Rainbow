@@ -69,12 +69,13 @@ def run_collapse(phi_deg, frames=250):
     pbuf = device.create_buffer(size=N*PS*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.COPY_SRC)
     device.queue.write_buffer(pbuf, 0, pdata.tobytes())
     ga = device.create_buffer(size=NG*NG*3*4, usage=wgpu.BufferUsage.STORAGE)
-    gv = device.create_buffer(size=NG*NG*8, usage=wgpu.BufferUsage.STORAGE)
-    uni = device.create_buffer(size=64, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+    gv = device.create_buffer(size=NG*NG*16, usage=wgpu.BufferUsage.STORAGE)
+    uni = device.create_buffer(size=80, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
     pvol = 0.5; pmass = 1.0   # mass-normalized units (see sandlab.html)
-    device.queue.write_buffer(uni, 0, struct.pack("16f",
+    rho_rest = (1/NG/0.006)**2
+    device.queue.write_buffer(uni, 0, struct.pack("20f",
         DT, NG, 1/NG, GRAV,  MU, LA, alpha_from_phi(phi_deg), pmass,
-        0,0,0,0,  0, float(N), NG, pvol))
+        0,0,0,0,  0, float(N), NG, pvol,  rho_rest, 0,0,0))
     def bg(pipe, bufs):
         return device.create_bind_group(layout=pipe.get_bind_group_layout(0),
             entries=[{"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}} for i, b in enumerate(bufs)])
@@ -125,11 +126,12 @@ def disturb_cycle():
     pbuf = device.create_buffer(size=N*PS*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.COPY_SRC)
     device.queue.write_buffer(pbuf, 0, pdata.tobytes())
     ga = device.create_buffer(size=NG*NG*3*4, usage=wgpu.BufferUsage.STORAGE)
-    gv = device.create_buffer(size=NG*NG*8, usage=wgpu.BufferUsage.STORAGE)
-    uni = device.create_buffer(size=64, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
-    device.queue.write_buffer(uni, 0, struct.pack("16f",
+    gv = device.create_buffer(size=NG*NG*16, usage=wgpu.BufferUsage.STORAGE)
+    uni = device.create_buffer(size=80, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+    rho_rest = (1/NG/0.006)**2
+    device.queue.write_buffer(uni, 0, struct.pack("20f",
         DT, NG, 1/NG, GRAV, MU, LA, alpha_from_phi(30), 1.0,
-        0,0,0,0, 0, float(N), NG, 0.5))
+        0,0,0,0, 0, float(N), NG, 0.5, rho_rest, 0,0,0))
     def bg(pipe, bufs):
         return device.create_bind_group(layout=pipe.get_bind_group_layout(0),
             entries=[{"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}} for i, b in enumerate(bufs)])
@@ -167,6 +169,71 @@ hs = disturb_cycle()
 print(f"settled height, then after 2 disturbance cycles: {['%.3f'%h for h in hs]}")
 check("PHYSICS: no density ratchet (height stable within 12% over cycles)",
       hs[1] < hs[0]*1.12 and hs[2] < hs[0]*1.12, str(hs))
+
+# ---- sustained-stir fluff test: drive a synthetic finger, density must recover ----
+def stir_test():
+    random.seed(11)
+    pts = []
+    y = 0.04
+    while y < 0.40:
+        x = 0.30
+        while x < 0.70:
+            pts.append((x + (random.random()-0.5)*0.004, y + (random.random()-0.5)*0.004))
+            x += 0.006
+        y += 0.006
+    N = len(pts)
+    pdata = array.array("f", [0.0]*(N*PS))
+    for i,(x,yy) in enumerate(pts):
+        b = i*PS; pdata[b]=x; pdata[b+1]=yy; pdata[b+8]=1.0; pdata[b+11]=1.0
+    pbuf = device.create_buffer(size=N*PS*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.COPY_SRC)
+    device.queue.write_buffer(pbuf, 0, pdata.tobytes())
+    ga = device.create_buffer(size=NG*NG*3*4, usage=wgpu.BufferUsage.STORAGE)
+    gv = device.create_buffer(size=NG*NG*16, usage=wgpu.BufferUsage.STORAGE)
+    uni = device.create_buffer(size=80, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+    def set_uni(mx=0.0, my=0.0, mvx=0.0, mvy=0.0, on=0.0):
+        rho_rest = (1/NG/0.006)**2
+        device.queue.write_buffer(uni, 0, struct.pack("20f",
+            DT, NG, 1/NG, GRAV, MU, LA, alpha_from_phi(20), 1.0,
+            mx, my, mvx, mvy, on, float(N), NG, 0.5, rho_rest, 0,0,0))
+    set_uni()
+    def bg(pipe, bufs):
+        return device.create_bind_group(layout=pipe.get_bind_group_layout(0),
+            entries=[{"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}} for i, b in enumerate(bufs)])
+    bgs = { 'clear': bg(clear_p,[ga]), 'p2g': bg(p2g_p,[pbuf,ga,uni]),
+            'grid': bg(grid_p,[ga,gv,uni]), 'g2p': bg(g2p_p,[pbuf,gv,uni]) }
+    def run(frames):
+        for f in range(frames):
+            enc = device.create_command_encoder()
+            for si in range(SUB):
+                for pipe,key,wg in [(clear_p,'clear',(NG*NG*3+255)//256),(p2g_p,'p2g',(N+63)//64),
+                                    (grid_p,'grid',(NG*NG+63)//64),(g2p_p,'g2p',(N+63)//64)]:
+                    cp = enc.begin_compute_pass(); cp.set_pipeline(pipe); cp.set_bind_group(0,bgs[key])
+                    cp.dispatch_workgroups(wg); cp.end()
+            device.queue.submit([enc.finish()])
+    def state():
+        out = array.array("f"); out.frombytes(bytes(device.queue.read_buffer(pbuf)))
+        ys = sorted(out[i*PS+1] for i in range(N))
+        vc = sum(out[i*PS+13] for i in range(N))/N
+        return ys[int(N*0.95)], vc
+    run(120)
+    h0, vc0 = state()
+    # synthetic finger: circles through the pile for 180 frames
+    for f in range(180):
+        ang = f * 0.25
+        mx = 0.5 + 0.22*math.cos(ang)
+        my = 0.14 + 0.10*math.sin(ang)
+        mvx = -math.sin(ang)*1.6
+        mvy = math.cos(ang)*1.6
+        set_uni(mx, my, mvx, mvy, 1.0)
+        run(1)
+    set_uni()
+    run(400)
+    h1, vc1 = state()
+    return h0, h1, vc0, vc1
+
+h0, h1, vc0, vc1 = stir_test()
+print(f"stir test: settled {h0:.3f} -> after stir+settle {h1:.3f}   mean vc {vc0:.4f} -> {vc1:.4f}")
+check("PHYSICS: sustained stirring does not fluff (height within 15%)", h1 < h0*1.15, f"{h0:.3f} -> {h1:.3f}")
 
 lo = run_collapse(15)
 hi = run_collapse(45)
