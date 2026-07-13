@@ -90,9 +90,14 @@ fn isSand(v: u32) -> bool { return v >= 1u && v <= 5u; }
 `;
 
 const WGSL_STEP = WGSL_COMMON + /* wgsl */`
-struct Params { w: u32, h: u32, offset: u32, seed: u32 };
+struct Params { w: u32, h: u32, offset: u32, seed: u32, pass: u32, p0: u32, p1: u32, p2: u32 };
 @group(0) @binding(0) var<storage, read_write> cells : array<u32>;
 @group(0) @binding(1) var<uniform> P : Params;
+
+fn colorOf(v: u32) -> u32 { return v & 0xffu; }
+fn velOf(v: u32) -> u32 { return (v >> 8u) & 0xfu; }
+fn withVel(v: u32, nv: u32) -> u32 { return (v & 0xffu) | (nv << 8u); }
+fn sandC(v: u32) -> bool { let c = v & 0xffu; return c >= 1u && c <= 5u; }
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -105,14 +110,34 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let iD = iC + 1u;
   var a = cells[iA]; var b = cells[iB];
   var c = cells[iC]; var d = cells[iD];
-  // straight falls within the block
-  if (isSand(a) && c == 0u) { c = a; a = 0u; }
-  if (isSand(b) && d == 0u) { d = b; b = 0u; }
-  // stochastic diagonal topple (~75%): irregular slopes
-  let r = pcg(iA ^ P.seed);
-  if ((r & 3u) != 0u) {
-    if (isSand(a) && c != 0u && d == 0u && b == 0u) { d = a; a = 0u; }
-    else if (isSand(b) && d != 0u && c == 0u && a == 0u) { c = b; b = 0u; }
+
+  // gravity: accelerate/decay once per frame (pass 0), move if vel > pass index
+  if (sandC(a)) {
+    var va = velOf(a);
+    if (c == 0u) {
+      if (P.pass == 0u) { va = min(va + 1u, 8u); }      // free fall: accelerate
+      if (va > P.pass) { c = withVel(a, va); a = 0u; }
+      else { a = withVel(a, va); }
+    } else if (P.pass == 0u) {
+      a = withVel(a, va - min(va, 2u));                  // blocked: decay toward rest
+    }
+  }
+  if (sandC(b)) {
+    var vb = velOf(b);
+    if (d == 0u) {
+      if (P.pass == 0u) { vb = min(vb + 1u, 8u); }
+      if (vb > P.pass) { d = withVel(b, vb); b = 0u; }
+      else { b = withVel(b, vb); }
+    } else if (P.pass == 0u) {
+      b = withVel(b, vb - min(vb, 2u));
+    }
+  }
+
+  // stochastic topple, resting grains only (vel <= 1), every pass -> fast settling
+  let r = pcg((iA ^ P.seed) + (P.pass * 747796405u));
+  if ((r & 7u) < 7u) {
+    if (sandC(a) && velOf(a) <= 1u && c != 0u && d == 0u && b == 0u) { d = withVel(a, 0u); a = 0u; }
+    else if (sandC(b) && velOf(b) <= 1u && d != 0u && c == 0u && a == 0u) { c = withVel(b, 0u); b = 0u; }
   }
   cells[iA] = a; cells[iB] = b; cells[iC] = c; cells[iD] = d;
 }
@@ -132,7 +157,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (jx < 0 || jx >= i32(S.w)) { return; }
   let jy = r2 % 5u;
   let i = jy * S.w + u32(jx);
-  if (cells[i] == 0u) { cells[i] = S.color; }
+  if (cells[i] == 0u) { cells[i] = S.color | (3u << 8u); }
 }
 `;
 
@@ -167,7 +192,7 @@ fn fs(@builtin(position) fc : vec4<f32>) -> @location(0) vec4<f32> {
   let x = min(u32(fc.x * f32(R.w) / f32(R.cw)), R.w - 1u);
   let y = min(u32(fc.y * f32(R.h) / f32(R.ch)), R.h - 1u);
   let i = y * R.w + x;
-  let v = cells[i];
+  let v = cells[i] & 0xffu;
   if (v == 0u) { return vec4<f32>(bg, 1.0); }
   var col : vec3<f32>;
   if (v == 1u)      { col = vec3<f32>(1.000, 0.353, 0.373); }
@@ -252,9 +277,10 @@ async function initGPU() {
     primitive: { topology: 'triangle-list' }
   });
 
-  // uniforms: two step-params (offset 0 / 1), spawn, clear, render
-  for (let o = 0; o < 2; o++) {
-    const u = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  // uniforms: one per sim pass (writeBuffer coalesces per submit, so shared buffers
+  // would give every pass the last-written values), plus spawn, clear, render
+  for (let o = 0; o < STEPS_PER_FRAME; o++) {
+    const u = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     stepUnis.push(u);
     stepBGs.push(device.createBindGroup({ layout: stepPipe.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: { buffer: cellsBuf } }, { binding: 1, resource: { buffer: u } }] }));
@@ -357,7 +383,7 @@ function gameOver() {
 // ---------------- async readback: bridges, occupancy, judging ----------------
 function processReadback(data) {
   let grains = 0;
-  for (let i = 0; i < data.length; i++) { const v = data[i]; if (v >= 1 && v <= 5) grains++; }
+  for (let i = 0; i < data.length; i++) { const v = data[i] & 0xff; if (v >= 1 && v <= 5) grains++; }
   grainCount = grains;
 
   // bridge detection: same-color component touching both walls
@@ -366,7 +392,7 @@ function processReadback(data) {
   const clearedColors = [];
   for (let y = 0; y < SIMH; y++) {
     const start = y * SIMW;
-    const v = data[start];
+    const v = data[start] & 0xff;
     if (v === 0 || v === STONE || seen[start]) continue;
     const comp = [start];
     seen[start] = 1;
@@ -375,10 +401,10 @@ function processReadback(data) {
       const i = comp[head];
       const cx = i % SIMW;
       if (cx === SIMW - 1) touchesRight = true;
-      if (cx > 0            && !seen[i - 1]    && data[i - 1] === v)    { seen[i - 1] = 1;    comp.push(i - 1); }
-      if (cx < SIMW - 1     && !seen[i + 1]    && data[i + 1] === v)    { seen[i + 1] = 1;    comp.push(i + 1); }
-      if (i >= SIMW         && !seen[i - SIMW] && data[i - SIMW] === v) { seen[i - SIMW] = 1; comp.push(i - SIMW); }
-      if (i < data.length - SIMW && !seen[i + SIMW] && data[i + SIMW] === v) { seen[i + SIMW] = 1; comp.push(i + SIMW); }
+      if (cx > 0            && !seen[i - 1]    && (data[i - 1] & 0xff) === v)    { seen[i - 1] = 1;    comp.push(i - 1); }
+      if (cx < SIMW - 1     && !seen[i + 1]    && (data[i + 1] & 0xff) === v)    { seen[i + 1] = 1;    comp.push(i + 1); }
+      if (i >= SIMW         && !seen[i - SIMW] && (data[i - SIMW] & 0xff) === v) { seen[i - SIMW] = 1; comp.push(i - SIMW); }
+      if (i < data.length - SIMW && !seen[i + SIMW] && (data[i + SIMW] & 0xff) === v) { seen[i + SIMW] = 1; comp.push(i + SIMW); }
     }
     if (touchesRight && comp.length >= 200) {
       for (const i of comp) clearedCells.push(i);
@@ -421,7 +447,7 @@ function processReadback(data) {
     let topFilled = 0;
     for (let y = 0; y < 6; y++)
       for (let x = 0; x < SIMW; x++)
-        if (data[y * SIMW + x] !== 0) topFilled++;
+        if ((data[y * SIMW + x] & 0xff) !== 0) topFilled++;
     if (colorsDone.every(v => v)) {
       phase = 'fanfare'; fanfareT = 0; fanfarePraised = false;
       praise = PRAISE[Math.floor(Math.random() * PRAISE.length)];
@@ -496,7 +522,11 @@ function frame(now) {
     const enc = device.createCommandEncoder();
 
     if (phase === 'pour' && pour) {
-      const n = Math.min(SPAWN_PER_FRAME, pour.remaining);
+      pour.age = (pour.age || 0) + dt;
+      const rampUp = Math.min(1, pour.age / 0.30);
+      const rampDown = Math.min(1, pour.remaining / (GRAINS_PER_BLOB * 0.18));
+      const rate = Math.max(0.08, Math.min(rampUp, rampDown));
+      const n = Math.min(Math.max(8, Math.floor(SPAWN_PER_FRAME * rate)), pour.remaining);
       device.queue.writeBuffer(spawnUni, 0, new Uint32Array([SIMW, SIMH, pour.x, pour.color + 1, n, (Math.random() * 0xffffffff) >>> 0, 0, 0]));
       const sp = enc.beginComputePass();
       sp.setPipeline(spawnPipe);
@@ -509,11 +539,10 @@ function frame(now) {
 
     if (phase === 'idle' || phase === 'pour' || phase === 'settle' || phase === 'judge') {
       for (let s = 0; s < STEPS_PER_FRAME; s++) {
-        const off = s & 1;
-        device.queue.writeBuffer(stepUnis[off], 0, new Uint32Array([SIMW, SIMH, off, (Math.random() * 0xffffffff) >>> 0]));
+        device.queue.writeBuffer(stepUnis[s], 0, new Uint32Array([SIMW, SIMH, s & 1, (Math.random() * 0xffffffff) >>> 0, s, 0, 0, 0]));
         const cp = enc.beginComputePass();
         cp.setPipeline(stepPipe);
-        cp.setBindGroup(0, stepBGs[off]);
+        cp.setBindGroup(0, stepBGs[s]);
         cp.dispatchWorkgroups(Math.ceil(SIMW / 2 / 8), Math.ceil(SIMH / 2 / 8));
         cp.end();
       }
@@ -537,7 +566,7 @@ function frame(now) {
   }
   if (phase === 'settle') {
     settleT += dt;
-    if (settleT > 0.9) phase = 'judge';   // decision happens on next readback
+    if (settleT > 0.6) phase = 'judge';   // decision happens on next readback
   }
   if (phase === 'fanfare') {
     fanfareT += dt;
