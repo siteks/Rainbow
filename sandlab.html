@@ -79,7 +79,8 @@
 <script type="module">
 const NG = 100;                // grid nodes per side
 const MAXP = 60000;
-const SUBSTEPS = 12;
+const SIM_SPEED = 0.30;        // sim-seconds per real second, refresh-rate independent
+const MAX_SUBSTEPS = 26;       // cost ceiling / spiral-of-death guard
 const DT = 4.0e-4;
 const GRAV = 32.0;
 const E_YOUNG = 1200.0, NU = 0.3;
@@ -469,9 +470,9 @@ function presetRain() {
       a.push([0.05 + Math.random() * 0.9, 0.45 + Math.random() * 0.5]);
   });
 }
-function pourAt(x) {
+function pourAt(x, dt) {
   if (count >= MAXP - 400) return;
-  const n = 350;
+  const n = Math.max(1, Math.round(21000 * dt));   // constant particles/second
   const data = new Float32Array(n * PSTRIDE);
   for (let i = 0; i < n; i++) {
     const b = i * PSTRIDE;
@@ -515,7 +516,7 @@ document.getElementById('bClear').addEventListener('click', () => { count = 0; }
 fricEl.addEventListener('input', () => { phiEl.textContent = fricEl.value + '°'; });
 
 // ---------------- loop ----------------
-let last = performance.now(), fps = 60, fpsAcc = 0, fpsN = 0, diagFrames = 8;
+let last = performance.now(), fps = 60, fpsAcc = 0, fpsN = 0, diagFrames = 8, simAcc = 0;
 const loadCv = document.getElementById('load');
 const loadCtx = loadCv.getContext('2d');
 const frameMs = new Float32Array(110).fill(16.7);
@@ -552,7 +553,11 @@ function frame(now) {
   if (fpsAcc > 0.5) { fps = Math.round(fpsN / fpsAcc); fpsAcc = 0; fpsN = 0; }
 
   if (device && phase === 'run') {
-    if (mouse.on && mouse.pouring) pourAt(mouse.x);
+    if (mouse.on && mouse.pouring) pourAt(mouse.x, dt);
+    simAcc += dt * SIM_SPEED;
+    const nSub = Math.min(MAX_SUBSTEPS, Math.floor(simAcc / DT));
+    simAcc -= nSub * DT;
+    if (simAcc > 4 * DT) simAcc = 4 * DT;   // drop excess after stalls
 
     const alpha = alphaFromPhi(parseFloat(fricEl.value));
     // mass-normalized units: p_mass = 1 so fixed-point grid atomics keep
@@ -571,7 +576,7 @@ function frame(now) {
     const enc = device.createCommandEncoder();
     const stampThis = hasTS && !tsPending;
     if (count > 0) {
-      for (let s = 0; s < SUBSTEPS; s++) {
+      for (let s = 0; s < nSub; s++) {
         let cp = (s === 0 && stampThis)
           ? enc.beginComputePass({ timestampWrites: { querySet: tsQuery, beginningOfPassWriteIndex: 0 } })
           : enc.beginComputePass();
@@ -614,7 +619,7 @@ function frame(now) {
       }).catch(() => { tsPending = false; });
     }
 
-    statsEl.textContent = count.toLocaleString() + ' material points · ' + SUBSTEPS + ' substeps · ' + fps + ' fps · MLS-MPM / Drucker–Prager';
+    statsEl.textContent = count.toLocaleString() + ' material points · ' + nSub + ' substeps/frame · ' + fps + ' fps · MLS-MPM / Drucker–Prager';
     frameMs[fmIdx] = dt * 1000;
     fmIdx = (fmIdx + 1) % frameMs.length;
     drawLoad(dt * 1000);
