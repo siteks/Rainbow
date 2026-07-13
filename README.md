@@ -1,19 +1,16 @@
-# Rainbow Rows
+# Rainbow Games
 
-A one-touch puzzle game: drop colored tiles, make runs of 5 consecutive tiles
-showing all five colors (across or down) to clear them. Clear enough runs to
-beat each round before the board fills. Rounds get faster, and from round 3
-the board starts pre-seeded with junk.
+A small arcade of original puzzle games. Single self-contained HTML files,
+no dependencies, no build step. Live via GitHub Pages.
 
-**Play:** enable GitHub Pages on this repo, then open the URL on your phone.
-Tip: "Add to Home Screen" in your browser menu gives it an app icon.
-
-Built as a single self-contained `index.html` — no build step, no dependencies.
-Designed to be wrapped with Capacitor for a native Android/iOS build later.
+- **index.html** — game picker menu
+- **rows.html** — Rainbow Rows: drop tiles, line up all five colors to clear
+- **silt.html** — Rainbow Silt: falling-sand puzzle; bridge the walls with one
+  color to wash it away, light up all five colors to win the round
 
 ## Dev log
-- v1–v2: full-row rainbow rule, 10x10, turn timer with auto-drop
-- v3: run-of-6 expansive clears, double bag
-- v4: 9x9, 5 colors, rounds with fanfare, junk seeding
-- v5: removed hint markers (playtest: harmful), full-width grid
-- v6: disintegration animation on clears; detection logic fuzz-tested
+- Rows v1–v8: full-row rule → run-of-5 expansive clears → 9x9/5-color rounds,
+  timer disc, deal-in animation, fuzz-tested clear detection
+- Silt v1: cellular sand sim (typed arrays, ~9k cells), bridge detection via
+  BFS, instant-clear-on-connection, stone terrain from round 2. Tuned
+  field-to-blob ratio so two same-color pours can bridge.

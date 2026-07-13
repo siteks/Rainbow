@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Rainbow Silt</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    background: #1a1430;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+  }
+  #game { display: block; width: 100%; height: 100%; }
+  #overlay {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    text-align: center; color: #f4f0ff;
+    background: rgba(26, 20, 48, 0.72);
+    backdrop-filter: blur(4px);
+    transition: opacity 0.25s; padding: 24px;
+  }
+  #overlay.hidden { opacity: 0; pointer-events: none; }
+  #overlay h1 {
+    font-size: 40px; font-weight: 800;
+    background: linear-gradient(90deg,#ff5a5f,#ffd93d,#4ecb71,#4ea8ff,#b06cff);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  #overlay p { margin-top: 14px; font-size: 14.5px; color: #b8aede; max-width: 300px; line-height: 1.65; }
+  #overlay .go-score { margin-top: 10px; font-size: 16px; color: #ffd93d; letter-spacing: 1px; }
+  #overlay .tap {
+    margin-top: 30px; font-size: 11px; letter-spacing: 4px;
+    text-transform: uppercase; color: #7c6fae;
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  @media (prefers-reduced-motion: reduce) { #overlay .tap { animation: none; } }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="overlay">
+  <h1>Rainbow Silt</h1>
+  <p id="msg">Tap to pour a stream of colored sand. Build a <b>bridge of one color from wall to wall</b> and it washes away. Light up all five colors to clear the round — but don't let the sand reach the top!</p>
+  <div class="go-score" id="goScore"></div>
+  <div class="tap">Tap to play</div>
+</div>
+
+<script>
+(() => {
+  const NCOLORS = 5;
+  const COLORS = ['#ff5a5f','#ffd93d','#4ecb71','#4ea8ff','#b06cff'];
+  const RGB = COLORS.map(h => [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)]);
+  const STONE_RGB = [92, 86, 128];
+  const EMPTY = 0, STONE = 6;   // cell values: 0 empty, 1..5 = color+1, 6 stone
+  const PRAISE = ['Well done!', 'Brilliant!', 'Splendid!', 'Nice one!', 'Superb!', 'Lovely stuff!'];
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const overlay = document.getElementById('overlay');
+  const msgEl = document.getElementById('msg');
+  const goScoreEl = document.getElementById('goScore');
+
+  // --- layout & sim buffers ---
+  const SIMW = 84;   // field ~1.7 blob-widths wide: two same-color pours can bridge
+  let SIMH = 140;
+  let W, H, px, simX, simY, simPixW, simPixH, trayY;
+  let grid, fade, img, off, offCtx;
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    px = W / SIMW;
+    SIMH = Math.max(80, Math.floor((H * 0.66) / px));
+    simX = 0; simY = Math.floor(H * 0.24);
+    simPixW = W; simPixH = SIMH * px;
+    trayY = simY - Math.min(64, H * 0.09);
+    grid = new Uint8Array(SIMW * SIMH);
+    fade = new Float32Array(SIMW * SIMH);
+    off = document.createElement('canvas');
+    off.width = SIMW; off.height = SIMH;
+    offCtx = off.getContext('2d');
+    img = offCtx.createImageData(SIMW, SIMH);
+  }
+  window.addEventListener('resize', () => { const wasMenu = phase === 'menu' || phase === 'over'; resize(); if (!wasMenu) startRound(round); });
+  let phase = 'menu';
+  resize();
+
+  const idx = (x, y) => y * SIMW + x;
+
+  // --- state ---
+  let bagQ, current, next1;
+  let score = 0, best = 0, bestRound = 1;
+  let round = 1, colorsDone, fanfareT = 0, praise = '', fanfarePraised = false;
+  let pour = null;             // {x, color, remaining}
+  let settleT = 0, chain = 0;
+  let floats = [], confetti = [];
+  let timeLeft = 7, turnTime = 7;
+  let sweepRight = true, frameCount = 0;
+  const GRAINS_PER_BLOB = 620;
+  const GRAINS_PER_FRAME = 12;   // must stay below spawn-zone drainage (~18/frame)
+
+  function drawBagColor() {
+    if (!bagQ || bagQ.length === 0) {
+      bagQ = [];
+      for (let i = 0; i < NCOLORS; i++) bagQ.push(i, i);
+      for (let i = bagQ.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [bagQ[i], bagQ[j]] = [bagQ[j], bagQ[i]];
+      }
+    }
+    return bagQ.pop();
+  }
+
+  function baseTurnTime() { return Math.max(3.2, 7.5 - 0.5 * (round - 1)); }
+  function newTurn() { turnTime = baseTurnTime(); timeLeft = turnTime; }
+
+  function seedStones() {
+    // From round 2: immovable stone clusters as terrain
+    const clusters = Math.min(8, (round - 1) * 2);
+    for (let k = 0; k < clusters; k++) {
+      const cx = 8 + Math.floor(Math.random() * (SIMW - 16));
+      const cy = Math.floor(SIMH * 0.35 + Math.random() * SIMH * 0.5);
+      const rad = 3 + Math.floor(Math.random() * 5);
+      for (let y = -rad; y <= rad; y++)
+        for (let x = -rad; x <= rad; x++) {
+          if (x * x + y * y > rad * rad) continue;
+          const gx = cx + x, gy = cy + y;
+          if (gx >= 0 && gx < SIMW && gy >= 0 && gy < SIMH) grid[idx(gx, gy)] = STONE;
+        }
+    }
+  }
+
+  function startRound(n) {
+    round = n;
+    grid.fill(EMPTY);
+    fade.fill(0);
+    colorsDone = new Array(NCOLORS).fill(false);
+    seedStones();
+    chain = 0;
+    pour = null;
+    newTurn();
+    phase = 'idle';
+  }
+
+  function reset() {
+    bagQ = [];
+    current = drawBagColor(); next1 = drawBagColor();
+    score = 0; floats = []; confetti = [];
+    startRound(1);
+  }
+
+  function advanceQueue() { current = next1; next1 = drawBagColor(); newTurn(); }
+
+  function startPour(x, forced) {
+    if (forced) addFloat('AUTO', x * px, simY - 16, '#ff5a5f');
+    pour = { x, color: current, remaining: GRAINS_PER_BLOB };
+    phase = 'pour';
+  }
+
+  function forcedPour() { startPour(6 + Math.floor(Math.random() * (SIMW - 12)), true); }
+
+  function addFloat(text, x, y, color) { floats.push({ text, x, y, life: 1, color }); }
+
+  function burstConfetti() {
+    for (let i = 0; i < 70; i++) {
+      confetti.push({
+        x: Math.random() * W, y: -20 - Math.random() * H * 0.3,
+        vy: 180 + Math.random() * 220, vx: (Math.random() - 0.5) * 60,
+        rot: Math.random() * Math.PI, vr: (Math.random() - 0.5) * 8,
+        color: COLORS[Math.floor(Math.random() * NCOLORS)], life: 1
+      });
+    }
+  }
+
+  // --- sand physics: one pass, bottom-up, alternating sweep ---
+  function stepSand() {
+    let moved = 0;
+    for (let y = SIMH - 2; y >= 0; y--) {
+      const rowBase = y * SIMW, below = rowBase + SIMW;
+      if (sweepRight) {
+        for (let x = 0; x < SIMW; x++) moved += moveGrain(x, rowBase, below);
+      } else {
+        for (let x = SIMW - 1; x >= 0; x--) moved += moveGrain(x, rowBase, below);
+      }
+    }
+    sweepRight = !sweepRight;
+    return moved;
+  }
+
+  function moveGrain(x, rowBase, below) {
+    const v = grid[rowBase + x];
+    if (v === EMPTY || v === STONE) return 0;
+    if (grid[below + x] === EMPTY) { grid[below + x] = v; grid[rowBase + x] = EMPTY; return 1; }
+    const dir = (Math.random() < 0.5) ? 1 : -1;
+    for (const d of [dir, -dir]) {
+      const nx = x + d;
+      if (nx < 0 || nx >= SIMW) continue;
+      if (grid[rowBase + nx] === EMPTY && grid[below + nx] === EMPTY) {
+        grid[below + nx] = v; grid[rowBase + x] = EMPTY; return 1;
+      }
+    }
+    return 0;
+  }
+
+  // --- bridge detection: same-color component touching both walls ---
+  const visited = new Uint8Array(0);
+  function findBridges() {
+    const seen = new Uint8Array(SIMW * SIMH);
+    const clearedCells = [];
+    const clearedColors = [];
+    for (let y = 0; y < SIMH; y++) {
+      const v = grid[idx(0, y)];
+      if (v === EMPTY || v === STONE || seen[idx(0, y)]) continue;
+      // BFS this same-color component from the left wall
+      const comp = [idx(0, y)];
+      seen[idx(0, y)] = 1;
+      let touchesRight = false;
+      for (let head = 0; head < comp.length; head++) {
+        const i = comp[head];
+        const cx = i % SIMW, cy = (i / SIMW) | 0;
+        if (cx === SIMW - 1) touchesRight = true;
+        if (cx > 0        && !seen[i - 1]    && grid[i - 1] === v)    { seen[i - 1] = 1;    comp.push(i - 1); }
+        if (cx < SIMW - 1 && !seen[i + 1]    && grid[i + 1] === v)    { seen[i + 1] = 1;    comp.push(i + 1); }
+        if (cy > 0        && !seen[i - SIMW] && grid[i - SIMW] === v) { seen[i - SIMW] = 1; comp.push(i - SIMW); }
+        if (cy < SIMH - 1 && !seen[i + SIMW] && grid[i + SIMW] === v) { seen[i + SIMW] = 1; comp.push(i + SIMW); }
+      }
+      if (touchesRight && comp.length >= 20) {
+        clearedCells.push(...comp);
+        clearedColors.push(v - 1);
+      }
+    }
+    return { clearedCells, clearedColors };
+  }
+
+  function checkClears() {
+    const { clearedCells, clearedColors } = findBridges();
+    if (clearedCells.length === 0) return false;
+    chain++;
+    const pts = Math.round(clearedCells.length * 2 * chain);
+    score += pts;
+    for (const c of clearedColors) colorsDone[c] = true;
+    let label = '+' + pts;
+    if (chain > 1) label = 'CHAIN x' + chain + '  ' + label;
+    addFloat(label, W / 2, simY + 40, chain > 1 ? '#ffd93d' : '#ffffff');
+    for (const i of clearedCells) { fade[i] = 1; grid[i] = EMPTY; }
+    return true;
+  }
+
+  function roundComplete() { return colorsDone.every(v => v); }
+
+  function topBlocked() {
+    let filled = 0;
+    for (let y = 0; y < 3; y++)
+      for (let x = 0; x < SIMW; x++)
+        if (grid[idx(x, y)] !== EMPTY) filled++;
+    return filled > SIMW * 0.5;
+  }
+
+  function gameOver() {
+    phase = 'over';
+    if (score > best) best = score;
+    if (round > bestRound) bestRound = round;
+    msgEl.innerHTML = 'The sand reached the top on round ' + round + '.';
+    goScoreEl.textContent = 'Score ' + score + '  ·  Best ' + best + ' (round ' + bestRound + ')';
+    setTimeout(() => overlay.classList.remove('hidden'), 400);
+  }
+
+  // --- input ---
+  window.addEventListener('pointerdown', (e) => {
+    if (phase === 'menu' || phase === 'over') {
+      overlay.classList.add('hidden');
+      reset();
+      return;
+    }
+    if (phase !== 'idle') return;
+    const y = e.clientY;
+    if (y < trayY || y > simY + simPixH) return;
+    const sx = Math.max(3, Math.min(SIMW - 4, Math.round(e.clientX / px)));
+    startPour(sx, false);
+  });
+
+  // --- rendering ---
+  function renderSand() {
+    const d = img.data;
+    for (let i = 0; i < grid.length; i++) {
+      const v = grid[i], o = i * 4;
+      if (v === EMPTY) {
+        if (fade[i] > 0) {
+          // washing-away sparkle
+          const f = fade[i];
+          d[o] = 255; d[o+1] = 255; d[o+2] = 255; d[o+3] = f * 200;
+        } else {
+          d[o+3] = 0;
+        }
+      } else if (v === STONE) {
+        const t = ((i * 2654435761) >>> 28) / 15;  // deterministic texture hash
+        d[o] = STONE_RGB[0] - t * 14; d[o+1] = STONE_RGB[1] - t * 14; d[o+2] = STONE_RGB[2] - t * 14; d[o+3] = 255;
+      } else {
+        const rgb = RGB[v - 1];
+        const t = ((i * 2654435761) >>> 27) / 31;  // per-cell shade variation
+        d[o] = rgb[0] * (0.82 + t * 0.18);
+        d[o+1] = rgb[1] * (0.82 + t * 0.18);
+        d[o+2] = rgb[2] * (0.82 + t * 0.18);
+        d[o+3] = 255;
+      }
+    }
+    offCtx.putImageData(img, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(off, simX, simY, simPixW, simPixH);
+  }
+
+  function roundRect(x, y, w, h, rad) {
+    ctx.beginPath();
+    ctx.moveTo(x + rad, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rad);
+    ctx.arcTo(x + w, y + h, x, y + h, rad);
+    ctx.arcTo(x, y + h, x, y, rad);
+    ctx.arcTo(x, y, x + w, y, rad);
+    ctx.closePath();
+  }
+
+  // --- main loop ---
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    frameCount++;
+
+    ctx.fillStyle = '#1a1430';
+    ctx.fillRect(0, 0, W, H);
+
+    // HUD
+    ctx.fillStyle = '#f4f0ff';
+    ctx.font = '200 34px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText(phase === 'menu' ? '' : score, W / 2, H * 0.07);
+    if (phase !== 'menu') {
+      ctx.fillStyle = '#7c6fae';
+      ctx.font = '600 11px system-ui';
+      ctx.fillText('ROUND ' + round, W / 2, H * 0.07 + 20);
+
+      // color progress swatches
+      const swy = H * 0.07 + 34, sw = 16;
+      for (let c = 0; c < NCOLORS; c++) {
+        const sx = W / 2 + (c - 2) * (sw + 8) - sw / 2;
+        ctx.globalAlpha = colorsDone[c] ? 1 : 0.22;
+        ctx.fillStyle = COLORS[c];
+        roundRect(sx, swy, sw, sw, 5);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+
+      // tray: current + next pour colors, timer disc
+      const ts = 34;
+      ctx.fillStyle = '#7c6fae';
+      ctx.font = '600 10px system-ui';
+      ctx.fillText('POUR', W / 2, trayY - 8);
+      ctx.fillStyle = COLORS[current];
+      ctx.beginPath(); ctx.arc(W / 2, trayY + ts / 2, ts / 2, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = COLORS[next1];
+      ctx.beginPath(); ctx.arc(W / 2 + ts * 1.3, trayY + ts / 2, ts / 3, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+
+      const frac = Math.max(0, timeLeft / turnTime);
+      const elapsedFrac = 1 - frac;
+      const tr = 13, tcx = W / 2 - ts * 1.5, tcy = trayY + ts / 2;
+      ctx.beginPath(); ctx.arc(tcx, tcy, tr, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.fill();
+      ctx.strokeStyle = 'rgba(124,111,174,0.35)'; ctx.lineWidth = 1; ctx.stroke();
+      if (elapsedFrac > 0 && phase === 'idle') {
+        ctx.beginPath();
+        ctx.moveTo(tcx, tcy);
+        ctx.arc(tcx, tcy, tr, -Math.PI / 2, -Math.PI / 2 + elapsedFrac * Math.PI * 2);
+        ctx.closePath();
+        ctx.fillStyle = frac > 0.35 ? 'rgba(124,111,174,0.55)' : 'rgba(255,90,95,0.85)';
+        ctx.fill();
+      }
+
+      // sim area frame
+      ctx.strokeStyle = 'rgba(124,111,174,0.3)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(0.5, simY - 0.5, W - 1, simPixH + 1);
+
+      // --- game logic ---
+      if (phase === 'idle') {
+        timeLeft -= dt;
+        if (timeLeft <= 0) forcedPour();
+      }
+
+      if (phase === 'pour' && pour) {
+        let spawned = 0;
+        for (let g = 0; g < GRAINS_PER_FRAME && pour.remaining > 0; g++) {
+          const jx = pour.x + Math.floor((Math.random() - 0.5) * 9);  // 9-column spawn spread
+          const gx = Math.max(0, Math.min(SIMW - 1, jx));
+          const gy = Math.floor(Math.random() * 2);                   // top 2 rows only
+          if (grid[idx(gx, gy)] === EMPTY) { grid[idx(gx, gy)] = pour.color + 1; pour.remaining--; spawned++; }
+        }
+        pour.stall = spawned === 0 ? (pour.stall || 0) + 1 : 0;
+        // abort if the spawn zone is buried (sand near the top): deliver no more, let it settle
+        if (pour.remaining <= 0 || pour.stall > 90) { pour = null; settleT = 0; phase = 'settle'; }
+      }
+
+      // physics runs in every active phase
+      if (phase === 'idle' || phase === 'pour' || phase === 'settle') {
+        stepSand();
+        stepSand();   // 2 substeps per frame for livelier sand
+        // bridges clear the moment they form, even mid-pour
+        if (frameCount % 12 === 0) checkClears();
+        if (phase === 'settle') {
+          settleT += dt;
+          if (settleT > 0.8) {
+            checkClears();
+            if (roundComplete()) {
+              phase = 'fanfare'; fanfareT = 0; fanfarePraised = false;
+              praise = PRAISE[Math.floor(Math.random() * PRAISE.length)];
+              burstConfetti();
+              addFloat('ROUND ' + round + ' CLEAR!', W / 2, H * 0.5, '#ffd93d');
+            } else if (topBlocked()) {
+              gameOver();
+            } else {
+              chain = 0;
+              advanceQueue();
+              phase = 'idle';
+            }
+          }
+        }
+      }
+
+      renderSand();
+
+      // fade decay for wash sparkle
+      for (let i = 0; i < fade.length; i++) if (fade[i] > 0) fade[i] = Math.max(0, fade[i] - dt * 2.2);
+
+      // pour position indicator
+      if (phase === 'idle') {
+        ctx.fillStyle = 'rgba(124,111,174,0.4)';
+        ctx.font = '10px system-ui';
+        ctx.fillText('tap the sand area to pour', W / 2, simY + simPixH + 18);
+      }
+
+      // fanfare
+      if (phase === 'fanfare') {
+        fanfareT += dt;
+        if (fanfareT > 0.85) {
+          if (!fanfarePraised) { fanfarePraised = true; burstConfetti(); }
+          const t = Math.min(1, (fanfareT - 0.85) * 4);
+          const pop = 1 + 0.18 * Math.sin(t * Math.PI);
+          ctx.save();
+          ctx.translate(W / 2, H * 0.44);
+          ctx.scale(pop, pop);
+          ctx.globalAlpha = t;
+          ctx.fillStyle = '#ffffff';
+          ctx.font = '800 36px system-ui';
+          ctx.fillText(praise, 0, 0);
+          ctx.globalAlpha = t * 0.8;
+          ctx.fillStyle = '#b8aede';
+          ctx.font = '600 14px system-ui';
+          ctx.fillText('Get ready for round ' + (round + 1), 0, 30);
+          ctx.restore();
+          ctx.globalAlpha = 1;
+        }
+        if (fanfareT > 2.6) { startRound(round + 1); advanceQueue(); }
+      }
+    }
+
+    // confetti
+    for (const p of confetti) {
+      p.y += p.vy * dt; p.x += p.vx * dt; p.rot += p.vr * dt;
+      if (p.y > H + 20) p.life = 0;
+      if (p.life <= 0) continue;
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-4, -2.5, 8, 5);
+      ctx.restore();
+    }
+    confetti = confetti.filter(p => p.life > 0);
+
+    // floating text
+    for (const f of floats) {
+      f.life -= dt * (f.text.startsWith('ROUND') ? 0.55 : 0.8);
+      f.y -= 28 * dt;
+      if (f.life <= 0) continue;
+      ctx.globalAlpha = Math.min(1, f.life);
+      ctx.fillStyle = f.color;
+      ctx.font = f.text.startsWith('ROUND') ? '800 30px system-ui' : '700 20px system-ui';
+      ctx.textAlign = 'center';
+      ctx.fillText(f.text, f.x, f.y);
+      ctx.globalAlpha = 1;
+    }
+    floats = floats.filter(f => f.life > 0);
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

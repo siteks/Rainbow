@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Rainbow Rows</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    background: #1a1430;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+  }
+  #game { display: block; width: 100%; height: 100%; }
+  #overlay {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    color: #f4f0ff;
+    background: rgba(26, 20, 48, 0.72);
+    backdrop-filter: blur(4px);
+    transition: opacity 0.25s;
+    padding: 24px;
+  }
+  #overlay.hidden { opacity: 0; pointer-events: none; }
+  #overlay h1 {
+    font-size: 40px;
+    font-weight: 800;
+    letter-spacing: 1px;
+    background: linear-gradient(90deg,#ff5a5f,#ffd93d,#4ecb71,#4ea8ff,#b06cff);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  #overlay p {
+    margin-top: 14px;
+    font-size: 14.5px;
+    color: #b8aede;
+    max-width: 300px;
+    line-height: 1.65;
+  }
+  #overlay .go-score {
+    margin-top: 10px;
+    font-size: 16px;
+    color: #ffd93d;
+    letter-spacing: 1px;
+  }
+  #overlay .tap {
+    margin-top: 30px;
+    font-size: 11px;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+    color: #7c6fae;
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  @media (prefers-reduced-motion: reduce) { #overlay .tap { animation: none; } }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="overlay">
+  <h1>Rainbow Rows</h1>
+  <p id="msg">Tap a column to drop the tile. Any <b>5 in a row — across or down — showing all five colors</b> clears. Clear enough runs to win the round; each round gets faster. Watch for chains as tiles fall!</p>
+  <div class="go-score" id="goScore"></div>
+  <div class="tap">Tap to play</div>
+</div>
+
+<script>
+(() => {
+  const N = 9;                  // 9x9 grid
+  const NCOLORS = 5;
+  const COLORS = ['#ff5a5f','#ffd93d','#4ecb71','#4ea8ff','#b06cff'];
+  const DARKER  = ['#c23e42','#c9a41f','#379b52','#3579c4','#8a48d6'];
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const overlay = document.getElementById('overlay');
+  const msgEl = document.getElementById('msg');
+  const goScoreEl = document.getElementById('goScore');
+
+  let W, H, cell, gridX, gridY, gridW, trayY;
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    gridW = Math.min(W, H * 0.62);
+    cell = gridW / N;
+    gridX = (W - gridW) / 2;
+    gridY = Math.min(H * 0.315, H - gridW - 12);
+    trayY = gridY - cell * 2.7;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // --- state ---
+  let board, bag, current, next1, next2, hold, holdUsed;
+  let score = 0, best = 0, bestRound = 1, phase = 'menu';
+  // phases: menu, idle, drop, flash, fanfare, over
+  let dropAnim = null, flashCells = [], flashT = 0, chain = 0;
+  let floats = [], confetti = [], debris = [], shakeX = 0;
+  let timeLeft = 6, turnTime = 6;
+  let round = 1, runsCleared = 0, roundGoal = 5, fanfareT = 0;
+  let dealT = 0, praise = '', fanfarePraised = false;
+  const PRAISE = ['Well done!', 'Brilliant!', 'Splendid!', 'Nice one!', 'Superb!', 'Lovely stuff!'];
+
+  function drawBag() {
+    if (!bag || bag.length === 0) {
+      bag = [];
+      for (let i = 0; i < NCOLORS; i++) bag.push(i, i);  // double bag
+      for (let i = bag.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [bag[i], bag[j]] = [bag[j], bag[i]];
+      }
+    }
+    return bag.pop();
+  }
+
+  function baseTurnTime() {
+    return Math.max(2.8, 6.2 - 0.45 * (round - 1));
+  }
+
+  function newTurn() {
+    turnTime = baseTurnTime();
+    timeLeft = turnTime;
+  }
+
+  function seedBoard() {
+    board = Array.from({length: N}, () => Array(N).fill(null));
+    // From round 3, pre-fill junk rows using only 4 of the 5 colors:
+    // a run needs all 5 colors, so the seed can never self-clear.
+    const junkRows = Math.min(3, Math.max(0, round - 2));
+    if (junkRows > 0) {
+      const palette = [0,1,2,3,4];
+      palette.splice(Math.floor(Math.random() * NCOLORS), 1); // drop one color
+      for (let r = N - junkRows; r < N; r++)
+        for (let c = 0; c < N; c++)
+          board[r][c] = palette[Math.floor(Math.random() * palette.length)];
+    }
+  }
+
+  function startRound(n) {
+    round = n;
+    runsCleared = 0;
+    roundGoal = 4 + round;      // 5, 6, 7, ...
+    seedBoard();
+    chain = 0;
+    newTurn();
+    dealT = 0;
+    phase = 'dealin';
+  }
+
+  function reset() {
+    bag = [];
+    current = drawBag(); next1 = drawBag(); next2 = drawBag();
+    hold = null; holdUsed = false;
+    score = 0; floats = []; confetti = []; debris = []; flashCells = [];
+    startRound(1);
+  }
+
+  function advanceQueue() {
+    current = next1; next1 = next2; next2 = drawBag();
+    holdUsed = false;
+    newTurn();
+  }
+
+  function landingRow(c) {
+    for (let r = N - 1; r >= 0; r--) if (board[r][c] === null) return r;
+    return -1;
+  }
+
+  function tryDrop(c, forced) {
+    const r = landingRow(c);
+    if (r === -1) { shakeX = 10; return false; }
+    if (forced) addFloat('AUTO', gridX + c * cell + cell / 2, gridY - 20, '#ff5a5f');
+    dropAnim = {
+      col: c, row: r, color: current,
+      y: trayY, targetY: gridY + r * cell, v: 0
+    };
+    phase = 'drop';
+    return true;
+  }
+
+  function forcedDrop() {
+    const open = [];
+    for (let c = 0; c < N; c++) if (landingRow(c) !== -1) open.push(c);
+    if (open.length === 0) { gameOver(); return; }
+    tryDrop(open[Math.floor(Math.random() * open.length)], true);
+  }
+
+  function windowIsRainbow(vals) {
+    return vals.every(v => v !== null) && new Set(vals).size === NCOLORS;
+  }
+
+  // Expansive: union of every valid window, horizontal and vertical
+  function findRuns() {
+    const cellsToClear = new Set();
+    for (let r = 0; r < N; r++) {
+      for (let s = 0; s + NCOLORS <= N; s++) {
+        const win = [];
+        for (let c = s; c < s + NCOLORS; c++) win.push(board[r][c]);
+        if (windowIsRainbow(win))
+          for (let c = s; c < s + NCOLORS; c++) cellsToClear.add(r + ',' + c);
+      }
+    }
+    for (let c = 0; c < N; c++) {
+      for (let s = 0; s + NCOLORS <= N; s++) {
+        const win = [];
+        for (let r = s; r < s + NCOLORS; r++) win.push(board[r][c]);
+        if (windowIsRainbow(win))
+          for (let r = s; r < s + NCOLORS; r++) cellsToClear.add(r + ',' + c);
+      }
+    }
+    return cellsToClear;
+  }
+
+  function addFloat(text, x, y, color) {
+    floats.push({ text, x, y, life: 1, color });
+  }
+
+  function burstConfetti() {
+    for (let i = 0; i < 70; i++) {
+      confetti.push({
+        x: Math.random() * W,
+        y: -20 - Math.random() * H * 0.3,
+        vy: 180 + Math.random() * 220,
+        vx: (Math.random() - 0.5) * 60,
+        rot: Math.random() * Math.PI,
+        vr: (Math.random() - 0.5) * 8,
+        color: COLORS[Math.floor(Math.random() * NCOLORS)],
+        life: 1
+      });
+    }
+  }
+
+  function resolve() {
+    const cellsToClear = findRuns();
+    if (cellsToClear.size > 0) {
+      chain++;
+      const extended = cellsToClear.size > NCOLORS;
+      const pts = cellsToClear.size * 25 * chain;
+      score += pts;
+      runsCleared += Math.max(1, Math.round(cellsToClear.size / NCOLORS));
+      let label = '+' + pts;
+      if (chain > 1) label = 'CHAIN x' + chain + '  ' + label;
+      else if (extended) label = 'BIG CLEAR  ' + label;
+      addFloat(label, W / 2, gridY - 14, (chain > 1 || extended) ? '#ffd93d' : '#ffffff');
+      flashCells = [...cellsToClear].map(s => s.split(',').map(Number));
+      flashT = 0;
+      phase = 'flash';
+    } else {
+      chain = 0;
+      if (runsCleared >= roundGoal) {
+        phase = 'fanfare';
+        fanfareT = 0;
+        fanfarePraised = false;
+        praise = PRAISE[Math.floor(Math.random() * PRAISE.length)];
+        burstConfetti();
+        addFloat('ROUND ' + round + ' CLEAR!', W / 2, H * 0.5, '#ffd93d');
+      } else if (board.every(row => row.every(v => v !== null))) {
+        gameOver();
+      } else {
+        advanceQueue();
+        phase = 'idle';
+      }
+    }
+  }
+
+  function spawnDebris(r, c, colorIdx) {
+    const cx = gridX + c * cell, cy = gridY + r * cell;
+    const n = 6;
+    for (let i = 0; i < n; i++) {
+      debris.push({
+        x: cx + cell * (0.2 + Math.random() * 0.6),
+        y: cy + cell * (0.2 + Math.random() * 0.6),
+        vx: (Math.random() - 0.5) * cell * 1.2,
+        vy: 30 + Math.random() * 90,            // biased downward
+        size: cell * (0.14 + Math.random() * 0.16),
+        color: COLORS[colorIdx],
+        rot: Math.random() * Math.PI,
+        vr: (Math.random() - 0.5) * 10,
+        life: 0.9 + Math.random() * 0.3
+      });
+    }
+  }
+
+  function clearAndGravity() {
+    for (const [r, c] of flashCells) {
+      if (board[r][c] !== null) spawnDebris(r, c, board[r][c]);
+      board[r][c] = null;
+    }
+    for (let c = 0; c < N; c++) {
+      const stack = [];
+      for (let r = N - 1; r >= 0; r--) if (board[r][c] !== null) stack.push(board[r][c]);
+      for (let r = N - 1; r >= 0; r--) board[r][c] = stack[N - 1 - r] !== undefined ? stack[N - 1 - r] : null;
+    }
+    flashCells = [];
+    resolve(); // chain check
+  }
+
+  function gameOver() {
+    phase = 'over';
+    if (score > best) best = score;
+    if (round > bestRound) bestRound = round;
+    msgEl.innerHTML = 'The board filled up on round ' + round + '.';
+    goScoreEl.textContent = 'Score ' + score + '  ·  Best ' + best + ' (round ' + bestRound + ')';
+    setTimeout(() => overlay.classList.remove('hidden'), 400);
+  }
+
+  function doHold() {
+    if (holdUsed) { shakeX = 6; return; }
+    if (hold === null) {
+      const held = current;
+      advanceQueue();
+      hold = held;
+      holdUsed = true;
+    } else {
+      const t = hold; hold = current; current = t;
+      holdUsed = true;
+    }
+  }
+
+  // --- input ---
+  window.addEventListener('pointerdown', (e) => {
+    if (phase === 'menu' || phase === 'over') {
+      overlay.classList.add('hidden');
+      reset();
+      return;
+    }
+    if (phase !== 'idle') return;
+    const x = e.clientX, y = e.clientY;
+    const ts = cell * 1.7;
+    if (y > trayY - ts * 0.4 && y < trayY + ts * 1.1 && x < gridX + ts * 1.3) {
+      doHold();
+      return;
+    }
+    if (x >= gridX && x <= gridX + gridW && y > trayY + ts * 1.1) {
+      tryDrop(Math.min(N - 1, Math.floor((x - gridX) / cell)), false);
+    }
+  });
+
+  // --- drawing helpers ---
+  function roundRect(x, y, w, h, rad) {
+    ctx.beginPath();
+    ctx.moveTo(x + rad, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rad);
+    ctx.arcTo(x + w, y + h, x, y + h, rad);
+    ctx.arcTo(x, y + h, x, y, rad);
+    ctx.arcTo(x, y, x + w, y, rad);
+    ctx.closePath();
+  }
+
+  function drawTile(x, y, size, colorIdx, alpha) {
+    const pad = size * 0.07;
+    ctx.globalAlpha = alpha !== undefined ? alpha : 1;
+    ctx.fillStyle = DARKER[colorIdx];
+    roundRect(x + pad, y + pad + size * 0.05, size - pad * 2, size - pad * 2, size * 0.22);
+    ctx.fill();
+    ctx.fillStyle = COLORS[colorIdx];
+    roundRect(x + pad, y + pad, size - pad * 2, size - pad * 2.4, size * 0.22);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.28)';
+    roundRect(x + pad * 2.2, y + pad * 2.2, size - pad * 4.4, size * 0.2, size * 0.1);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawLabel(text, x, y) {
+    ctx.fillStyle = '#7c6fae';
+    ctx.font = '600 10px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText(text, x, y);
+  }
+
+  // --- loop ---
+  let last = performance.now();
+  let pulse = 0;
+  function frame(now) {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    pulse += dt;
+
+    ctx.fillStyle = '#1a1430';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.save();
+    if (shakeX > 0.3) {
+      ctx.translate((Math.random() - 0.5) * shakeX, 0);
+      shakeX *= 0.85;
+    }
+
+    // HUD
+    ctx.fillStyle = '#f4f0ff';
+    ctx.font = '200 34px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText(phase === 'menu' ? '' : score, W / 2, H * 0.075);
+    if (phase !== 'menu') {
+      ctx.fillStyle = '#7c6fae';
+      ctx.font = '600 11px system-ui';
+      ctx.fillText('ROUND ' + round + '   ·   ' + Math.min(runsCleared, roundGoal) + ' / ' + roundGoal + ' RUNS', W / 2, H * 0.075 + 22);
+    }
+
+    if (phase !== 'menu') {
+      // turn timer (paused during animations & fanfare)
+      if (phase === 'idle') {
+        timeLeft -= dt;
+        if (timeLeft <= 0) forcedDrop();
+      }
+
+      // tray: hold | current | next
+      const ts = cell * 1.7;
+      const holdX = gridX + cell * 0.2;
+      drawLabel('HOLD', holdX + ts / 2, trayY - ts * 0.22);
+      ctx.strokeStyle = 'rgba(124,111,174,0.4)';
+      ctx.lineWidth = 1.5;
+      roundRect(holdX, trayY, ts, ts, ts * 0.22);
+      ctx.stroke();
+      if (hold !== null) drawTile(holdX, trayY, ts, hold, holdUsed ? 0.45 : 1);
+
+      const curX = W / 2 - ts / 2;
+      drawLabel('DROP', W / 2, trayY - ts * 0.22);
+      if (phase !== 'drop') drawTile(curX, trayY, ts, current);
+
+      const n1X = gridX + gridW - ts * 1.6;
+      drawLabel('NEXT', n1X + ts * 0.8, trayY - ts * 0.22);
+      drawTile(n1X, trayY + ts * 0.08, ts * 0.8, next1);
+      drawTile(n1X + ts * 0.85, trayY + ts * 0.18, ts * 0.62, next2, 0.6);
+
+      // timer disc: fills clockwise as the turn elapses
+      const frac = Math.max(0, timeLeft / turnTime);
+      const elapsedFrac = 1 - frac;
+      const tr = cell * 0.38;
+      const tcx = W / 2 - ts / 2 - tr - 12;
+      const tcy = trayY + ts / 2;
+      ctx.beginPath();
+      ctx.arc(tcx, tcy, tr, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255,255,255,0.06)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(124,111,174,0.35)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      if (elapsedFrac > 0 && phase !== 'fanfare') {
+        ctx.beginPath();
+        ctx.moveTo(tcx, tcy);
+        ctx.arc(tcx, tcy, tr, -Math.PI / 2, -Math.PI / 2 + elapsedFrac * Math.PI * 2);
+        ctx.closePath();
+        ctx.fillStyle = frac > 0.35 ? 'rgba(124,111,174,0.55)' : 'rgba(255,90,95,0.85)';
+        ctx.fill();
+      }
+
+      // grid background
+      for (let r = 0; r < N; r++) {
+        for (let c = 0; c < N; c++) {
+          ctx.fillStyle = 'rgba(255,255,255,0.045)';
+          roundRect(gridX + c * cell + 1.5, gridY + r * cell + 1.5, cell - 3, cell - 3, cell * 0.2);
+          ctx.fill();
+        }
+      }
+
+      // placed tiles (dealt in with a stagger at round start)
+      for (let r = 0; r < N; r++)
+        for (let c = 0; c < N; c++)
+          if (board[r][c] !== null) {
+            if (phase === 'dealin') {
+              const delay = c * 0.04 + (N - 1 - r) * 0.06;
+              const prog = Math.min(1, Math.max(0, (dealT - delay) * 5));
+              if (prog <= 0) continue;
+              const eased = 1 - (1 - prog) * (1 - prog);
+              const y = gridY + r * cell - (1 - eased) * cell * 3;
+              drawTile(gridX + c * cell, y, cell, board[r][c], prog);
+            } else {
+              drawTile(gridX + c * cell, gridY + r * cell, cell, board[r][c]);
+            }
+          }
+
+      // drop animation
+      if (phase === 'drop' && dropAnim) {
+        dropAnim.v += 5200 * dt;
+        dropAnim.y += dropAnim.v * dt;
+        if (dropAnim.y >= dropAnim.targetY) {
+          board[dropAnim.row][dropAnim.col] = dropAnim.color;
+          dropAnim = null;
+          resolve();
+        } else {
+          drawTile(gridX + dropAnim.col * cell, dropAnim.y, cell, dropAnim.color);
+        }
+      }
+
+      // flash animation
+      if (phase === 'flash') {
+        flashT += dt;
+        const a = 0.5 + 0.5 * Math.sin(flashT * 30);
+        for (const [r, c] of flashCells) {
+          ctx.fillStyle = `rgba(255,255,255,${0.35 + a * 0.5})`;
+          roundRect(gridX + c * cell + 1.5, gridY + r * cell + 1.5, cell - 3, cell - 3, cell * 0.2);
+          ctx.fill();
+        }
+        if (flashT > 0.38) clearAndGravity();
+      }
+
+      // fanfare between rounds
+      if (phase === 'fanfare') {
+        fanfareT += dt;
+        if (fanfareT > 0.85) {
+          if (!fanfarePraised) { fanfarePraised = true; burstConfetti(); }
+          const t = Math.min(1, (fanfareT - 0.85) * 4);
+          const pop = 1 + 0.18 * Math.sin(t * Math.PI);
+          ctx.save();
+          ctx.translate(W / 2, H * 0.44);
+          ctx.scale(pop, pop);
+          ctx.globalAlpha = t;
+          ctx.fillStyle = '#ffffff';
+          ctx.font = '800 36px system-ui';
+          ctx.textAlign = 'center';
+          ctx.fillText(praise, 0, 0);
+          ctx.globalAlpha = t * 0.8;
+          ctx.fillStyle = '#b8aede';
+          ctx.font = '600 14px system-ui';
+          ctx.fillText('Get ready for round ' + (round + 1), 0, 30);
+          ctx.restore();
+          ctx.globalAlpha = 1;
+        }
+        if (fanfareT > 2.6) startRound(round + 1);
+      }
+
+      // new-round deal-in
+      if (phase === 'dealin') {
+        dealT += dt;
+        const hasTiles = board.some(row => row.some(v => v !== null));
+        const bannerA = Math.max(0, Math.min(1, dealT * 4) - Math.max(0, (dealT - 0.9) * 2.5));
+        if (bannerA > 0) {
+          ctx.globalAlpha = bannerA;
+          ctx.fillStyle = '#ffd93d';
+          ctx.font = '800 28px system-ui';
+          ctx.textAlign = 'center';
+          ctx.fillText('ROUND ' + round, W / 2, gridY - 30);
+          ctx.globalAlpha = 1;
+        }
+        if (dealT > (hasTiles ? 1.15 : 0.8)) { newTurn(); phase = 'idle'; }
+      }
+
+      // open-column hints
+      if (phase === 'idle') {
+        ctx.fillStyle = 'rgba(124,111,174,0.35)';
+        ctx.font = '9px system-ui';
+        ctx.textAlign = 'center';
+        for (let c = 0; c < N; c++) {
+          if (landingRow(c) !== -1)
+            ctx.fillText('▾', gridX + c * cell + cell / 2, gridY - 22);
+        }
+      }
+    }
+
+    // disintegration debris: fragments tumble downward and fade
+    for (const d of debris) {
+      d.vy += 1400 * dt;               // gravity
+      d.x += d.vx * dt; d.y += d.vy * dt;
+      d.vx *= 0.985;
+      d.rot += d.vr * dt;
+      d.life -= dt * 1.5;
+      if (d.life <= 0) continue;
+      ctx.save();
+      ctx.translate(d.x, d.y);
+      ctx.rotate(d.rot);
+      ctx.globalAlpha = Math.min(1, d.life * 1.6);
+      ctx.fillStyle = d.color;
+      const sz = d.size * Math.min(1, d.life + 0.3);
+      roundRect(-sz / 2, -sz / 2, sz, sz, sz * 0.3);
+      ctx.fill();
+      ctx.restore();
+      ctx.globalAlpha = 1;
+    }
+    debris = debris.filter(d => d.life > 0);
+
+    // confetti
+    for (const p of confetti) {
+      p.y += p.vy * dt; p.x += p.vx * dt; p.rot += p.vr * dt;
+      if (p.y > H + 20) p.life = 0;
+      if (p.life <= 0) continue;
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-4, -2.5, 8, 5);
+      ctx.restore();
+    }
+    confetti = confetti.filter(p => p.life > 0);
+
+    // floating score text
+    for (const f of floats) {
+      f.life -= dt * (f.text.startsWith('ROUND') ? 0.55 : 0.8);
+      f.y -= 28 * dt;
+      if (f.life <= 0) continue;
+      ctx.globalAlpha = Math.min(1, f.life);
+      ctx.fillStyle = f.color;
+      ctx.font = f.text.startsWith('ROUND') ? '800 30px system-ui' : '700 20px system-ui';
+      ctx.textAlign = 'center';
+      ctx.fillText(f.text, f.x, f.y);
+      ctx.globalAlpha = 1;
+    }
+    floats = floats.filter(f => f.life > 0);
+
+    ctx.restore();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
