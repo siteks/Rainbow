@@ -107,6 +107,67 @@ def check(name, cond, detail=""):
     print(("PASS " if cond else "FAIL ") + name + ("" if cond else "  " + detail))
     if not cond: fails += 1
 
+# ---- disturbance ratchet test: poke settled sand twice, density must recover ----
+def disturb_cycle():
+    random.seed(11)
+    pts = []
+    y = 0.04
+    while y < 0.40:
+        x = 0.30
+        while x < 0.70:
+            pts.append((x + (random.random()-0.5)*0.004, y + (random.random()-0.5)*0.004))
+            x += 0.006
+        y += 0.006
+    N = len(pts)
+    pdata = array.array("f", [0.0]*(N*PS))
+    for i,(x,yy) in enumerate(pts):
+        b = i*PS; pdata[b]=x; pdata[b+1]=yy; pdata[b+8]=1.0; pdata[b+11]=1.0
+    pbuf = device.create_buffer(size=N*PS*4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.COPY_SRC)
+    device.queue.write_buffer(pbuf, 0, pdata.tobytes())
+    ga = device.create_buffer(size=NG*NG*3*4, usage=wgpu.BufferUsage.STORAGE)
+    gv = device.create_buffer(size=NG*NG*8, usage=wgpu.BufferUsage.STORAGE)
+    uni = device.create_buffer(size=64, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+    device.queue.write_buffer(uni, 0, struct.pack("16f",
+        DT, NG, 1/NG, GRAV, MU, LA, alpha_from_phi(30), 1.0,
+        0,0,0,0, 0, float(N), NG, 0.5))
+    def bg(pipe, bufs):
+        return device.create_bind_group(layout=pipe.get_bind_group_layout(0),
+            entries=[{"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}} for i, b in enumerate(bufs)])
+    bgs = { 'clear': bg(clear_p,[ga]), 'p2g': bg(p2g_p,[pbuf,ga,uni]),
+            'grid': bg(grid_p,[ga,gv,uni]), 'g2p': bg(g2p_p,[pbuf,gv,uni]) }
+    def run(frames):
+        for f in range(frames):
+            enc = device.create_command_encoder()
+            for si in range(SUB):
+                for pipe,key,wg in [(clear_p,'clear',(NG*NG*3+255)//256),(p2g_p,'p2g',(N+63)//64),
+                                    (grid_p,'grid',(NG*NG+63)//64),(g2p_p,'g2p',(N+63)//64)]:
+                    cp = enc.begin_compute_pass(); cp.set_pipeline(pipe); cp.set_bind_group(0,bgs[key])
+                    cp.dispatch_workgroups(wg); cp.end()
+            device.queue.submit([enc.finish()])
+    def p95h():
+        out = array.array("f"); out.frombytes(bytes(device.queue.read_buffer(pbuf)))
+        ys = sorted(out[i*PS+1] for i in range(N))
+        return ys[int(N*0.95)], out
+    run(120)
+    h0, out = p95h()
+    heights = [h0]
+    rndv = random.Random(99)
+    for cyc in range(2):
+        # disturbance: random velocity kick to every particle
+        for i in range(N):
+            out[i*PS+2] = (rndv.random()-0.5)*0.8
+            out[i*PS+3] = rndv.random()*0.5
+        device.queue.write_buffer(pbuf, 0, out.tobytes())
+        run(160)
+        h, out = p95h()
+        heights.append(h)
+    return heights
+
+hs = disturb_cycle()
+print(f"settled height, then after 2 disturbance cycles: {['%.3f'%h for h in hs]}")
+check("PHYSICS: no density ratchet (height stable within 12% over cycles)",
+      hs[1] < hs[0]*1.12 and hs[2] < hs[0]*1.12, str(hs))
+
 lo = run_collapse(15)
 hi = run_collapse(45)
 print(f"phi=15: runout {lo['runout']:.3f} height {lo['height']:.3f} ke {lo['ke']:.5f}")
