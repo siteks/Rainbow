@@ -90,7 +90,7 @@ fn isSand(v: u32) -> bool { return v >= 1u && v <= 5u; }
 `;
 
 const WGSL_STEP = WGSL_COMMON + /* wgsl */`
-struct Params { w: u32, h: u32, offset: u32, seed: u32, pass: u32, p0: u32, p1: u32, p2: u32 };
+struct Params { w: u32, h: u32, offset: u32, seed: u32, pidx: u32, p0: u32, p1: u32, p2: u32 };
 @group(0) @binding(0) var<storage, read_write> cells : array<u32>;
 @group(0) @binding(1) var<uniform> P : Params;
 
@@ -115,26 +115,26 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (sandC(a)) {
     var va = velOf(a);
     if (c == 0u) {
-      if (P.pass == 0u) { va = min(va + 1u, 8u); }      // free fall: accelerate
-      if (va > P.pass) { c = withVel(a, va); a = 0u; }
+      if (P.pidx == 0u) { va = min(va + 1u, 8u); }      // free fall: accelerate
+      if (va > P.pidx) { c = withVel(a, va); a = 0u; }
       else { a = withVel(a, va); }
-    } else if (P.pass == 0u) {
+    } else if (P.pidx == 0u) {
       a = withVel(a, va - min(va, 2u));                  // blocked: decay toward rest
     }
   }
   if (sandC(b)) {
     var vb = velOf(b);
     if (d == 0u) {
-      if (P.pass == 0u) { vb = min(vb + 1u, 8u); }
-      if (vb > P.pass) { d = withVel(b, vb); b = 0u; }
+      if (P.pidx == 0u) { vb = min(vb + 1u, 8u); }
+      if (vb > P.pidx) { d = withVel(b, vb); b = 0u; }
       else { b = withVel(b, vb); }
-    } else if (P.pass == 0u) {
+    } else if (P.pidx == 0u) {
       b = withVel(b, vb - min(vb, 2u));
     }
   }
 
   // stochastic topple, resting grains only (vel <= 1), every pass -> fast settling
-  let r = pcg((iA ^ P.seed) + (P.pass * 747796405u));
+  let r = pcg((iA ^ P.seed) + (P.pidx * 747796405u));
   if ((r & 7u) < 7u) {
     if (sandC(a) && velOf(a) <= 1u && c != 0u && d == 0u && b == 0u) { d = withVel(a, 0u); a = 0u; }
     else if (sandC(b) && velOf(b) <= 1u && d != 0u && c == 0u && a == 0u) { c = withVel(b, 0u); b = 0u; }
