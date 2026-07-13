@@ -20,6 +20,22 @@ for name in ["WGSL_CLEAR", "WGSL_P2G", "WGSL_GRID", "WGSL_G2P", "WGSL_RENDER"]:
     except Exception as e:
         print(f"VALIDATE {name}: FAIL\n{e}"); sys.exit(1)
 
+# also validate the full render pipeline (vertex-buffer layout) headlessly
+try:
+    device.create_render_pipeline(
+        layout="auto",
+        vertex={"module": mods["WGSL_RENDER"], "entry_point": "vs", "buffers": [{
+            "array_stride": 48, "step_mode": wgpu.VertexStepMode.instance,
+            "attributes": [
+                {"shader_location": 0, "offset": 0, "format": wgpu.VertexFormat.float32x2},
+                {"shader_location": 1, "offset": 8, "format": wgpu.VertexFormat.float32x2}]}]},
+        fragment={"module": mods["WGSL_RENDER"], "entry_point": "fs",
+                  "targets": [{"format": wgpu.TextureFormat.bgra8unorm}]},
+        primitive={"topology": wgpu.PrimitiveTopology.triangle_list})
+    print("VALIDATE render pipeline (vertex-buffer layout): OK")
+except Exception as e:
+    print("VALIDATE render pipeline: FAIL", e); sys.exit(1)
+
 NG = 64; DT = 3.0e-4; GRAV = 25.0
 E, NU = 1200.0, 0.3
 MU = E / (2*(1+NU)); LA = E*NU/((1+NU)*(1-2*NU))

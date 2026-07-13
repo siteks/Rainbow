@@ -297,30 +297,23 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 `;
 
 const WGSL_RENDER = /* wgsl */`
-struct Sim {
-  a : vec4<f32>, b : vec4<f32>, m : vec4<f32>, c : vec4<f32>,
-};
-@group(0) @binding(0) var<storage, read> P : array<f32>;
-@group(0) @binding(1) var<uniform> S : Sim;
-
 struct VOut {
   @builtin(position) pos : vec4<f32>,
   @location(0) col : vec3<f32>,
 };
 
 @vertex
-fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VOut {
+fn vs(@builtin(vertex_index) vi : u32,
+      @builtin(instance_index) ii : u32,
+      @location(0) ppos : vec2<f32>,
+      @location(1) pvel : vec2<f32>) -> VOut {
   var corners = array<vec2<f32>, 6>(
     vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
     vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0));
-  let pb = ii * 12u;
-  let x = vec2<f32>(P[pb], P[pb + 1u]);
-  let v = vec2<f32>(P[pb + 2u], P[pb + 3u]);
   var o : VOut;
-  let half = vec2<f32>(0.0016, 0.0016);
-  let ndc = x * 2.0 - vec2<f32>(1.0);
-  o.pos = vec4<f32>(ndc + corners[vi] * half * 2.0, 0.0, 1.0);
-  // strata bands by particle id, warmed by speed
+  let hs = vec2<f32>(0.0016, 0.0016);
+  let ndc = ppos * 2.0 - vec2<f32>(1.0);
+  o.pos = vec4<f32>(ndc + corners[vi] * hs * 2.0, 0.0, 1.0);
   let band = (ii / 6000u) % 5u;
   var base : vec3<f32>;
   if (band == 0u)      { base = vec3<f32>(1.00, 0.35, 0.37); }
@@ -328,7 +321,7 @@ fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VOu
   else if (band == 2u) { base = vec3<f32>(0.31, 0.80, 0.44); }
   else if (band == 3u) { base = vec3<f32>(0.31, 0.66, 1.00); }
   else                 { base = vec3<f32>(0.69, 0.42, 1.00); }
-  let sp = clamp(length(v) * 1.2, 0.0, 1.0);
+  let sp = clamp(length(pvel) * 1.2, 0.0, 1.0);
   o.col = base * (0.75 + 0.25 * sp) + vec3<f32>(sp * 0.25);
   return o;
 }
@@ -343,7 +336,7 @@ fn fs(in : VOut) -> @location(0) vec4<f32> {
 let device, ctxGpu, format;
 let pBuf, gaBuf, gvBuf, simUni;
 let clearPipe, p2gPipe, gridPipe, g2pPipe, renderPipe;
-let clearBG, p2gBG, gridBG, g2pBG, renderBG;
+let clearBG, p2gBG, gridBG, g2pBG;
 let count = 0;
 let W, H, side, topY;
 let mouse = { on: 0, x: 0.5, y: 0.5, vx: 0, vy: 0, lastX: 0, lastY: 0, pouring: false };
@@ -370,7 +363,7 @@ async function initGPU() {
   ctxGpu = gpuCanvas.getContext('webgpu');
   ctxGpu.configure({ device, format, alphaMode: 'opaque' });
 
-  pBuf = device.createBuffer({ size: MAXP * PSTRIDE * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  pBuf = device.createBuffer({ size: MAXP * PSTRIDE * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.VERTEX });
   gaBuf = device.createBuffer({ size: NG * NG * 3 * 4, usage: GPUBufferUsage.STORAGE });
   gvBuf = device.createBuffer({ size: NG * NG * 8, usage: GPUBufferUsage.STORAGE });
   simUni = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -389,7 +382,14 @@ async function initGPU() {
   const rmod = await mk(WGSL_RENDER);
   renderPipe = await device.createRenderPipelineAsync({
     layout: 'auto',
-    vertex: { module: rmod, entryPoint: 'vs' },
+    vertex: { module: rmod, entryPoint: 'vs', buffers: [{
+      arrayStride: PSTRIDE * 4,
+      stepMode: 'instance',
+      attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x2' },
+        { shaderLocation: 1, offset: 8, format: 'float32x2' }
+      ]
+    }] },
     fragment: { module: rmod, entryPoint: 'fs', targets: [{ format }] },
     primitive: { topology: 'triangle-list' }
   });
@@ -405,9 +405,6 @@ async function initGPU() {
   g2pBG = device.createBindGroup({ layout: g2pPipe.getBindGroupLayout(0), entries: [
     { binding: 0, resource: { buffer: pBuf } }, { binding: 1, resource: { buffer: gvBuf } },
     { binding: 2, resource: { buffer: simUni } }] });
-  renderBG = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
-    { binding: 0, resource: { buffer: pBuf } }, { binding: 1, resource: { buffer: simUni } }] });
-
   tapEl.textContent = 'Tap to begin';
   return true;
 }
@@ -493,7 +490,7 @@ document.getElementById('bClear').addEventListener('click', () => { count = 0; }
 fricEl.addEventListener('input', () => { phiEl.textContent = fricEl.value + '°'; });
 
 // ---------------- loop ----------------
-let last = performance.now(), fps = 60, fpsAcc = 0, fpsN = 0;
+let last = performance.now(), fps = 60, fpsAcc = 0, fpsN = 0, diagFrames = 8;
 function alphaFromPhi(deg) {
   const s = Math.sin(deg * Math.PI / 180);
   return Math.sqrt(2 / 3) * 2 * s / (3 - s);
@@ -519,6 +516,8 @@ function frame(now) {
       (mouse.on && !mouse.pouring) ? 1 : 0, count, NG, pvol
     ]));
 
+    const diag = diagFrames > 0;
+    if (diag) { diagFrames--; device.pushErrorScope('validation'); }
     const enc = device.createCommandEncoder();
     if (count > 0) {
       for (let s = 0; s < SUBSTEPS; s++) {
@@ -540,11 +539,12 @@ function frame(now) {
     const rp = enc.beginRenderPass({ colorAttachments: [{ view, clearValue: { r: 0.07, g: 0.055, b: 0.13, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
     if (count > 0) {
       rp.setPipeline(renderPipe);
-      rp.setBindGroup(0, renderBG);
+      rp.setVertexBuffer(0, pBuf);
       rp.draw(6, count);
     }
     rp.end();
     device.queue.submit([enc.finish()]);
+    if (diag) { device.popErrorScope().then(e => { if (e) fatal('GPU validation: ' + e.message); }); }
 
     statsEl.textContent = count.toLocaleString() + ' material points · ' + SUBSTEPS + ' substeps · ' + fps + ' fps · MLS-MPM / Drucker–Prager';
   }
