@@ -68,7 +68,7 @@
   <div class="ctl"><label>Accelerating voltage <output id="oV">10.0 kV</output></label>
     <input type="range" id="sV" min="1" max="30" step="0.1" value="10"></div>
   <div class="ctl"><label>Lens field B&#8320; <output id="oB">42.0 mT</output></label>
-    <input type="range" id="sB" min="0" max="120" step="0.05" value="42"></div>
+    <input type="range" id="sB" min="0" max="120" step="0.02" value="42"></div>
   <div class="ctl"><label>Working distance <output id="oW">20 mm</output></label>
     <input type="range" id="sW" min="12" max="60" step="0.5" value="20"></div>
   <div class="ctl"><label>Aperture semi-angle <output id="oA">4.0 mrad</output></label>
@@ -306,19 +306,20 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }`;
 
 const CONV = /*wgsl*/`
-@group(0) @binding(0) var<uniform> kR: vec4u;
+@group(0) @binding(0) var<uniform> kp: vec4f; // radius (taps), tap stride (image px), -, -
 @group(0) @binding(1) var<storage, read> kern: array<f32>;
 @group(0) @binding(2) var specTex: texture_2d<f32>;
 @group(0) @binding(3) var imgTex: texture_storage_2d<r32float, write>;
 @compute @workgroup_size(8,8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   if (gid.x >= ${IMG_N}u || gid.y >= ${IMG_N}u) { return; }
-  let R = i32(kR.x); let W = 2*R + 1;
+  let R = i32(kp.x); let W = 2*R + 1;
   var acc = 0.0;
   for (var dy = -R; dy <= R; dy++) {
     for (var dx = -R; dx <= R; dx++) {
       let w = kern[u32((dy+R)*W + (dx+R))];
-      let c = vec2i(gid.xy) + vec2i(dx, dy) + ${MARGIN};
+      let off = vec2i(round(vec2f(f32(dx), f32(dy)) * kp.y));
+      let c = clamp(vec2i(gid.xy) + off + ${MARGIN}, vec2i(0), vec2i(${SPEC_N - 1}));
       acc += w * textureLoad(specTex, c, 0).r;
     }
   }
@@ -577,20 +578,27 @@ async function boot() {
     const histPitch = extent/HIST_N;
     const rmsR = sum ? Math.sqrt(sr2/sum)*histPitch : 0;   // metres
     const imgPitch = P.FOV/IMG_N;
-    const kR = Math.min(KMAX, Math.max(0, Math.ceil((extent/2)/imgPitch) - 1));
+    // tap spacing grows so the kernel always spans the whole PSF,
+    // even when the probe is far wider than the field of view
+    const strideM = Math.max(imgPitch, (extent/2)/KMAX);
+    const kR = Math.min(KMAX, Math.max(0, Math.ceil((extent/2)/strideM)));
+    const bilin = (hx, hy) => {
+      const x0 = Math.floor(hx), y0 = Math.floor(hy);
+      const fx = hx - x0, fy = hy - y0;
+      const at = (x, y) => (x >= 0 && y >= 0 && x < HIST_N && y < HIST_N) ? hist[y*HIST_N + x] : 0;
+      return at(x0,y0)*(1-fx)*(1-fy) + at(x0+1,y0)*fx*(1-fy)
+           + at(x0,y0+1)*(1-fx)*fy   + at(x0+1,y0+1)*fx*fy;
+    };
     const W = 2*kR + 1, kern = new Float32Array((2*KMAX+1)**2);
     let ksum = 0;
     for (let ky = -kR; ky <= kR; ky++) for (let kx = -kR; kx <= kR; kx++) {
-      const hx = cx + kx*imgPitch/histPitch, hy = cy + ky*imgPitch/histPitch;
-      const ix = Math.round(hx), iy = Math.round(hy);
-      let v = 0;
-      if (ix >= 0 && iy >= 0 && ix < HIST_N && iy < HIST_N) v = hist[iy*HIST_N + ix];
+      const v = bilin(cx + kx*strideM/histPitch, cy + ky*strideM/histPitch);
       kern[(ky+kR)*W + (kx+kR)] = v; ksum += v;
     }
     if (ksum === 0) { kern[kR*W + kR] = 1; ksum = 1; }     // sub-pixel probe = delta
     for (let i = 0; i < W*W; i++) kern[i] /= ksum;
     device.queue.writeBuffer(kernBuf, 0, kern);
-    device.queue.writeBuffer(kRBuf, 0, new Uint32Array([kR, 0, 0, 0]));
+    device.queue.writeBuffer(kRBuf, 0, new Float32Array([kR, strideM/imgPitch, 0, 0]));
     // specimen (on FOV change) + convolution
     const e3 = device.createCommandEncoder();
     if (dirtySpec) {
@@ -606,7 +614,10 @@ async function boot() {
     device.queue.submit([e3.finish()]);
     // stats
     const d = 2.355*rmsR; // FWHM-ish from rms
-    const focused = zCross > 0 && Math.abs(zCross - P.zS) < 0.4e-3;
+    const alphaImg = isFinite(px.Mag) && px.Mag > 0 ? P.alpha/px.Mag : P.alpha;
+    const floorR = Mag*P.srcR + 3e-8;
+    const dofT = Math.max(2*floorR/alphaImg, 1.5e-4);
+    const focused = zCross > 0 && Math.abs(zCross - P.zS) < dofT;
     $('stats').innerHTML =
       `crossover&nbsp; <b>${zCross > 0 ? (zCross*1e3).toFixed(1)+' mm' : 'beyond sample'}</b>` +
       (focused ? ' <span class="ok">&#9679; in focus</span>'
