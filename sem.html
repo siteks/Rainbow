@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Beam Lab</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    background: #1a1430;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    color: #f4f0ff;
+    -webkit-user-select: none; user-select: none;
+  }
+  #stage { position: fixed; inset: 0 300px 0 0; }
+  canvas#gpu, canvas#ui { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #gpu { z-index: 0; } #ui { z-index: 1; pointer-events: none; }
+  #panel {
+    position: fixed; right: 0; top: 0; bottom: 0; width: 300px;
+    background: rgba(255,255,255,0.04);
+    border-left: 1px solid rgba(124,111,174,0.35);
+    padding: 18px 18px 30px; overflow-y: auto; z-index: 2;
+  }
+  #panel h1 {
+    font-size: 24px; font-weight: 800;
+    background: linear-gradient(90deg,#ff5a5f,#ffd93d,#4ecb71,#4ea8ff,#b06cff);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  #panel .sub { color: #7c6fae; font-size: 10px; letter-spacing: 3px; text-transform: uppercase; margin: 4px 0 16px; }
+  .ctl { margin-bottom: 13px; }
+  .ctl label { display: flex; justify-content: space-between; font-size: 12px; color: #b8aede; margin-bottom: 3px; }
+  .ctl label output { color: #f4f0ff; font-variant-numeric: tabular-nums; }
+  .ctl input[type=range] { width: 100%; accent-color: #4ea8ff; }
+  button {
+    width: 100%; padding: 10px; margin: 4px 0 14px;
+    font: inherit; font-weight: 700; font-size: 13px;
+    color: #1a1430; background: linear-gradient(90deg,#ffd93d,#4ecb71);
+    border: 0; border-radius: 10px; cursor: pointer;
+  }
+  button:active { transform: scale(0.98); }
+  #stats { font-size: 11.5px; color: #b8aede; line-height: 1.7; border-top: 1px solid rgba(124,111,174,0.35); padding-top: 12px; }
+  #stats b { color: #f4f0ff; font-weight: 600; }
+  #stats .ok { color: #4ecb71; } #stats .off { color: #ff5a5f; }
+  #overlay {
+    position: fixed; inset: 0; z-index: 3;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; background: rgba(26,20,48,0.86); backdrop-filter: blur(4px); padding: 24px;
+  }
+  #overlay.hidden { display: none; }
+  #overlay h1 { font-size: 38px; font-weight: 800;
+    background: linear-gradient(90deg,#ff5a5f,#ffd93d,#4ecb71,#4ea8ff,#b06cff);
+    -webkit-background-clip: text; background-clip: text; color: transparent; }
+  #overlay p { margin-top: 14px; font-size: 14.5px; color: #b8aede; max-width: 340px; line-height: 1.65; }
+  #overlay .err { margin-top: 14px; font-size: 12px; color: #ff5a5f; max-width: 340px; word-break: break-word; }
+  @media (max-width: 720px) {
+    #stage { inset: 0 0 46% 0; }
+    #panel { top: auto; left: 0; width: 100%; height: 46%; border-left: 0; border-top: 1px solid rgba(124,111,174,0.35); }
+  }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="gpu"></canvas><canvas id="ui"></canvas></div>
+<div id="panel">
+  <h1>Beam Lab</h1>
+  <div class="sub">single-lens SEM &middot; webgpu</div>
+  <div class="ctl"><label>Accelerating voltage <output id="oV">10.0 kV</output></label>
+    <input type="range" id="sV" min="1" max="30" step="0.1" value="10"></div>
+  <div class="ctl"><label>Lens field B&#8320; <output id="oB">42.0 mT</output></label>
+    <input type="range" id="sB" min="0" max="120" step="0.05" value="42"></div>
+  <div class="ctl"><label>Working distance <output id="oW">20 mm</output></label>
+    <input type="range" id="sW" min="12" max="60" step="0.5" value="20"></div>
+  <div class="ctl"><label>Aperture semi-angle <output id="oA">4.0 mrad</output></label>
+    <input type="range" id="sA" min="0.5" max="15" step="0.1" value="4"></div>
+  <div class="ctl"><label>Source size (diam.) <output id="oS">2.0 &micro;m</output></label>
+    <input type="range" id="sS" min="0.1" max="20" step="0.1" value="2"></div>
+  <div class="ctl"><label>Energy spread &Delta;E <output id="oE">1.5 eV</output></label>
+    <input type="range" id="sE" min="0" max="10" step="0.1" value="1.5"></div>
+  <div class="ctl"><label>Beam current (dose) <output id="oD">30 %</output></label>
+    <input type="range" id="sD" min="1" max="100" step="1" value="30"></div>
+  <div class="ctl"><label>Field of view <output id="oF">12 &micro;m</output></label>
+    <input type="range" id="sF" min="0.3" max="1.9" step="0.01" value="1.08"></div>
+  <button id="focusBtn">Autofocus lens</button>
+  <div id="stats">loading&hellip;</div>
+</div>
+<div id="overlay">
+  <h1>Beam Lab</h1>
+  <p>A single-lens scanning electron microscope. Every frame, thousands of electrons fly through a Glaser magnetic lens in a compute shader; their landing pattern is the probe, and the probe makes the image.</p>
+  <div class="err" id="err"></div>
+</div>
+
+<script type="module">
+// ---------- physical constants ----------
+const QE = 1.602176634e-19, ME = 9.1093837015e-31, C = 2.99792458e8;
+// ---------- column geometry (metres) ----------
+const ZL = 0.100;      // lens centre (source at z = 0)
+const GA = 0.010;      // Glaser half-width a
+const HIST_N = 128;    // PSF histogram resolution
+const IMG_N = 256;     // SEM image resolution
+const SPEC_N = 384;    // specimen texture (image + margin)
+const MARGIN = (SPEC_N - IMG_N) / 2;
+const KMAX = 24;       // max convolution kernel radius, px
+const NTOTAL = 131072;
+const NTRAJ = 64, TRAJ_PTS = 256;
+
+const $ = id => document.getElementById(id);
+const P = {}; // live parameters
+function readSliders() {
+  P.V   = +$('sV').value * 1e3;          // volts
+  P.B0  = +$('sB').value * 1e-3;         // tesla
+  P.WD  = +$('sW').value * 1e-3;         // m
+  P.alpha = +$('sA').value * 1e-3;       // rad
+  P.srcR  = +$('sS').value * 1e-6 / 2;   // radius, m
+  P.dE  = +$('sE').value;                // eV
+  P.dose = +$('sD').value;
+  P.FOV = Math.pow(10, +$('sF').value) * 1e-6; // 2–80 µm, log slider
+  P.zS  = ZL + P.WD;
+  $('oV').textContent = (P.V/1e3).toFixed(1)+' kV';
+  $('oB').textContent = (P.B0*1e3).toFixed(2)+' mT';
+  $('oW').textContent = (P.WD*1e3).toFixed(1)+' mm';
+  $('oA').textContent = (P.alpha*1e3).toFixed(1)+' mrad';
+  $('oS').textContent = (P.srcR*2e6).toFixed(1)+' \u00b5m';
+  $('oE').textContent = P.dE.toFixed(1)+' eV';
+  $('oD').textContent = P.dose+' %';
+  $('oF').textContent = (P.FOV*1e6).toPrecision(3)+' \u00b5m';
+}
+
+// ---------- paraxial oracle (CPU): r'' = -K(z) r,  K = eB(z)^2 / (8 m V_r) ----------
+function relV(V) { return V * (1 + QE*V/(2*ME*C*C)); }
+function Bz(z, B0) { const u = (z - ZL)/GA; return B0/(1 + u*u); }
+function paraxial(B0, V, zEnd) {
+  const Vr = relV(V), kc = QE/(8*ME*Vr);
+  const dz = 2e-4, n = Math.ceil(zEnd/dz);
+  // ray 1: point source, r=0, r'=1 ; ray 2: field ray, r=1, r'=0
+  let r1=0, s1=1, r2=1, s2=0, zCross = Infinity, Mag = NaN;
+  for (let i=0; i<n; i++) {
+    const z = i*dz;
+    const step = (r,s) => { // RK4 on [r' = s, s' = -K r]
+      const K1 = kc*Bz(z,B0)**2, K2 = kc*Bz(z+dz/2,B0)**2, K3 = kc*Bz(z+dz,B0)**2;
+      const k1r=s,            k1s=-K1*r;
+      const k2r=s+dz/2*k1s,   k2s=-K2*(r+dz/2*k1r);
+      const k3r=s+dz/2*k2s,   k3s=-K2*(r+dz/2*k2r);
+      const k4r=s+dz*k3s,     k4s=-K3*(r+dz*k3r);
+      return [r + dz/6*(k1r+2*k2r+2*k3r+k4r), s + dz/6*(k1s+2*k2s+2*k3s+k4s)];
+    };
+    const p1 = step(r1,s1), p2 = step(r2,s2);
+    if (zCross === Infinity && z > ZL - 3*GA && r1 > 0 && p1[0] <= 0) {
+      zCross = z + dz * r1/(r1 - p1[0]);
+      Mag = Math.abs(r2 + (p2[0]-r2) * (zCross-z)/dz);
+    }
+    r1=p1[0]; s1=p1[1]; r2=p2[0]; s2=p2[1];
+  }
+  return { zCross, Mag, rAtEnd: Math.abs(r1) }; // rAtEnd per unit launch angle
+}
+function autofocus() {
+  let lo = 0.5e-3, hi = 200e-3; // zCross decreases as B0 grows
+  for (let i=0; i<48; i++) {
+    const mid = (lo+hi)/2;
+    (paraxial(mid, P.V, P.zS + 0.02).zCross > P.zS) ? lo = mid : hi = mid;
+  }
+  $('sB').value = ((lo+hi)/2*1e3).toFixed(2);
+}
+
+// ---------- WGSL ----------
+const COMMON = /*wgsl*/`
+struct Prm {
+  B0:f32, V:f32, dE:f32, srcR:f32,
+  alpha:f32, zS:f32, extent:f32, seed:f32,
+  fov:f32, dose:f32, time:f32, kR:f32,
+};
+const ZL = ${ZL}; const GA = ${GA};
+const QE = ${QE}; const ME = ${ME}; const CC = ${C};
+fn pcg2(v: vec2u) -> vec2u {
+  var p = v * 1664525u + 1013904223u;
+  p.x += p.y*1664525u; p.y += p.x*1664525u;
+  p ^= p >> vec2u(16u);
+  p.x += p.y*1664525u; p.y += p.x*1664525u;
+  return p ^ (p >> vec2u(16u));
+}
+fn rand2(st: ptr<function, vec2u>) -> vec2f {
+  *st = pcg2(*st);
+  return vec2f(*st) * (1.0/4294967295.0);
+}
+fn gauss2(st: ptr<function, vec2u>) -> vec2f {
+  let u = rand2(st);
+  let r = sqrt(-2.0*log(max(u.x, 1e-12)));
+  return r * vec2f(cos(6.2831853*u.y), sin(6.2831853*u.y));
+}
+// Glaser bell field, on-axis and derivatives (in z)
+fn glaser(z: f32, B0: f32) -> vec4f { // (B, B', B'', B''')
+  let u = (z - ZL)/GA; let D = 1.0 + u*u;
+  return vec4f(
+    B0/D,
+    -2.0*B0*u/(GA*D*D),
+    B0*(6.0*u*u - 2.0)/(GA*GA*D*D*D),
+    B0*(24.0*u - 24.0*u*u*u)/(GA*GA*GA*D*D*D*D));
+}
+// full off-axis expansion: Bz = B - r^2/4 B'', Br = -r/2 B' + r^3/16 B'''
+fn bField(p: vec3f, B0: f32) -> vec3f {
+  let g = glaser(p.z, B0);
+  let r2 = p.x*p.x + p.y*p.y;
+  let f = -0.5*g.y + r2*g.w/16.0;
+  return vec3f(p.x*f, p.y*f, g.x - 0.25*r2*g.z);
+}
+fn accel(p: vec3f, v: vec3f, B0: f32, qm: f32) -> vec3f {
+  return qm * cross(v, bField(p, B0));
+}`;
+
+const FLY = COMMON + /*wgsl*/`
+@group(0) @binding(0) var<uniform> prm: Prm;
+@group(0) @binding(1) var<storage, read_write> hist: array<atomic<u32>>;
+@group(0) @binding(2) var<storage, read_write> traj: array<vec2f>;
+@group(0) @binding(3) var<uniform> mode: vec4u; // x: 0=fly 1=traj, y: batch
+
+fn integrate(p0: vec3f, v0: vec3f, qm: f32, ti: u32) -> vec3f {
+  var p = p0; var v = v0;
+  let spd = length(v);
+  let dt = 2.5e-4 / spd;                 // ~0.25 mm per step
+  let stride = max(1u, u32(ceil((prm.zS/2.5e-4)/f32(${TRAJ_PTS}))));
+  var k = 0u;
+  for (var s = 0u; s < 1400u; s++) {
+    if (mode.x == 1u && s % stride == 0u && k < ${TRAJ_PTS}u) {
+      traj[ti*${TRAJ_PTS}u + k] = vec2f(p.z, p.x);
+      k++;
+    }
+    // RK4 (Lorentz)
+    let a1 = accel(p, v, prm.B0, qm);
+    let p2 = p + 0.5*dt*v;              let v2 = v + 0.5*dt*a1;
+    let a2 = accel(p2, v2, prm.B0, qm);
+    let p3 = p + 0.5*dt*v2;             let v3 = v + 0.5*dt*a2;
+    let a3 = accel(p3, v3, prm.B0, qm);
+    let p4 = p + dt*v3;                 let v4 = v + dt*a3;
+    let a4 = accel(p4, v4, prm.B0, qm);
+    let pn = p + dt/6.0*(v + 2.0*v2 + 2.0*v3 + v4);
+    let vn = v + dt/6.0*(a1 + 2.0*a2 + 2.0*a3 + a4);
+    if (pn.z >= prm.zS) {
+      let t = (prm.zS - p.z)/(pn.z - p.z);
+      p = mix(p, pn, t);
+      if (mode.x == 1u) { // pad trajectory to plane
+        for (; k < ${TRAJ_PTS}u; k++) { traj[ti*${TRAJ_PTS}u + k] = vec2f(p.z, p.x); }
+      }
+      return p;
+    }
+    p = pn; v = vn;
+  }
+  return vec3f(1e9);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  var qmV: f32; var p0: vec3f; var v0: vec3f;
+  if (mode.x == 1u) { // deterministic rainbow fan, meridional launch
+    if (i >= ${NTRAJ}u) { return; }
+    let a = (f32(i)/f32(${NTRAJ - 1}) * 2.0 - 1.0) * prm.alpha;
+    let gam = 1.0 + QE*prm.V/(ME*CC*CC);
+    let spd = CC*sqrt(1.0 - 1.0/(gam*gam));
+    p0 = vec3f(0.0); v0 = spd*normalize(vec3f(a, 0.0, 1.0));
+    qmV = -QE/(gam*ME);
+    let pf = integrate(p0, v0, qmV, i);
+  } else {
+    if (i >= ${NTOTAL}u) { return; }
+    var st = pcg2(vec2u(i, u32(prm.seed) ^ (i*2654435761u)));
+    let g = gauss2(&st);
+    let u = rand2(&st);
+    let E = prm.V + g.y*prm.dE;                        // chromatic spread
+    let gam = 1.0 + QE*E/(ME*CC*CC);
+    let spd = CC*sqrt(1.0 - 1.0/(gam*gam));
+    let src = gauss2(&st)*prm.srcR*0.5;                // gaussian source disc (sigma = R/2)
+    let aR = prm.alpha*sqrt(u.x); let aT = 6.2831853*u.y; // uniform over aperture
+    p0 = vec3f(src, 0.0);
+    v0 = spd*normalize(vec3f(aR*cos(aT), aR*sin(aT), 1.0));
+    qmV = -QE/(gam*ME);
+    let pf = integrate(p0, v0, qmV, 0u);
+    let q = pf.xy/prm.extent + 0.5;
+    if (all(q >= vec2f(0.0)) && all(q < vec2f(1.0))) {
+      let c = vec2u(q * ${HIST_N}.0);
+      atomicAdd(&hist[c.y*${HIST_N}u + c.x], 1u);
+    }
+  }
+}`;
+
+const SPECIMEN = /*wgsl*/`
+@group(0) @binding(0) var<uniform> prm: vec4f; // fov(m), time, -, -
+@group(0) @binding(1) var<storage, read> discs: array<vec4f>; // x,y (µm), r (µm), tone
+@group(0) @binding(2) var specTex: texture_storage_2d<r32float, write>;
+@compute @workgroup_size(8,8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= ${SPEC_N}u || gid.y >= ${SPEC_N}u) { return; }
+  let pitch = prm.x/${IMG_N}.0 * 1e6;                 // µm per px
+  let w = (vec2f(gid.xy) - ${SPEC_N/2}.0) * pitch;    // µm, centred
+  var s = 0.22 + 0.05*sin(w.x*7.1)*sin(w.y*6.3);      // substrate
+  for (var i = 0u; i < 96u; i++) {
+    let d = discs[i];
+    let dist = distance(w, d.xy);
+    if (dist < d.z) {
+      let h = sqrt(max(1.0 - (dist/d.z)*(dist/d.z), 0.0));
+      s = 0.34 + 0.30*d.w + 0.18*h;                    // particle body, top-lit
+    }
+    let e = abs(dist - d.z);
+    let ew = max(d.z*0.10, pitch*1.2);
+    s += 0.55 * exp(-(e*e)/(2.0*ew*ew)) * (0.5 + 0.5*d.w); // SE edge bloom
+  }
+  textureStore(specTex, gid.xy, vec4f(clamp(s, 0.0, 1.6), 0.0, 0.0, 1.0));
+}`;
+
+const CONV = /*wgsl*/`
+@group(0) @binding(0) var<uniform> kR: vec4u;
+@group(0) @binding(1) var<storage, read> kern: array<f32>;
+@group(0) @binding(2) var specTex: texture_2d<f32>;
+@group(0) @binding(3) var imgTex: texture_storage_2d<r32float, write>;
+@compute @workgroup_size(8,8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= ${IMG_N}u || gid.y >= ${IMG_N}u) { return; }
+  let R = i32(kR.x); let W = 2*R + 1;
+  var acc = 0.0;
+  for (var dy = -R; dy <= R; dy++) {
+    for (var dx = -R; dx <= R; dx++) {
+      let w = kern[u32((dy+R)*W + (dx+R))];
+      let c = vec2i(gid.xy) + vec2i(dx, dy) + ${MARGIN};
+      acc += w * textureLoad(specTex, c, 0).r;
+    }
+  }
+  textureStore(imgTex, gid.xy, vec4f(acc, 0.0, 0.0, 1.0));
+}`;
+
+const COMPOSITE = COMMON + /*wgsl*/`
+struct Rects { col: vec4f, img: vec4f, psf: vec4f, focal: vec4f }; // focal: zCross, rScale, canvasH, -
+@group(0) @binding(0) var<uniform> prm: Prm;
+@group(0) @binding(1) var<uniform> rc: Rects;
+@group(0) @binding(2) var imgTex: texture_2d<f32>;
+@group(0) @binding(3) var<storage, read> hist: array<u32>;
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  let p = array(vec2f(-1,-1), vec2f(3,-1), vec2f(-1,3));
+  return vec4f(p[vi], 0.0, 1.0);
+}
+fn inRect(p: vec2f, r: vec4f) -> bool { return all(p >= r.xy) && all(p < r.xy + r.zw); }
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+  let p = fc.xy;
+  var col = vec3f(0.102, 0.078, 0.188); // #1a1430
+  if (inRect(p, rc.col)) {
+    let t = (p - rc.col.xy) / rc.col.zw;      // t.y: 0 top(source) -> 1 (past sample)
+    let z = t.y * rc.focal.w;                  // z span mapped in focal.w
+    col = vec3f(0.125, 0.098, 0.22);
+    let g = glaser(z, prm.B0).x / max(prm.B0, 1e-6); // lens glow
+    col += vec3f(0.30, 0.16, 0.42) * g * 0.55;
+    if (abs(t.x - 0.5) < 0.0012) { col += vec3f(0.10); }                    // axis
+    if (abs(z - prm.zS) < rc.focal.w*0.0022) { col = vec3f(0.72, 0.66, 0.3); } // sample plane
+    if (rc.focal.x > 0.0 && abs(z - rc.focal.x) < rc.focal.w*0.0015) {
+      col = mix(col, vec3f(0.31, 0.80, 0.44), 0.85);                        // crossover
+    }
+  }
+  if (inRect(p, rc.img)) {
+    let uv = (p - rc.img.xy) / rc.img.zw;
+    let v = textureLoad(imgTex, vec2i(uv * ${IMG_N}.0), 0).r;
+    var st = pcg2(vec2u(p) + vec2u(u32(prm.time)*2654435769u, 40503u));
+    let n = gauss2(&st).x;
+    let dose = prm.dose * 90.0;                       // electrons per px, ish
+    let vn = clamp(v + n * sqrt(max(v, 0.02)/dose)*4.0, 0.0, 1.4);
+    col = vec3f(vn*0.72);
+    col.b += vn*0.03;                                  // faint phosphor cool
+  }
+  if (inRect(p, rc.psf)) {
+    let uv = (p - rc.psf.xy) / rc.psf.zw;
+    let c = vec2u(uv * ${HIST_N}.0);
+    let h = f32(hist[min(c.y,${HIST_N-1}u)*${HIST_N}u + min(c.x,${HIST_N-1}u)]);
+    let v = log(1.0 + h) / 7.0;
+    col = mix(vec3f(0.08, 0.06, 0.15), vec3f(1.0, 0.85, 0.35), clamp(v, 0.0, 1.0));
+  }
+  return vec4f(col, 1.0);
+}`;
+
+// ---------- boot ----------
+const errBox = $('err');
+async function boot() {
+  if (!navigator.gpu) throw new Error('WebGPU is not available in this browser.');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error('No GPU adapter found.');
+  const device = await adapter.requestDevice();
+  const canvas = $('gpu'), ui = $('ui'), uictx = ui.getContext('2d');
+  const ctx = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: 'opaque' });
+
+  // --- buffers / textures ---
+  const prmBuf  = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const modeBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const rectBuf = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const histBuf = device.createBuffer({ size: HIST_N*HIST_N*4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  const histStage = device.createBuffer({ size: HIST_N*HIST_N*4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const trajBuf = device.createBuffer({ size: NTRAJ*TRAJ_PTS*8, usage: GPUBufferUsage.STORAGE });
+  const kernBuf = device.createBuffer({ size: (2*KMAX+1)**2*4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const kRBuf   = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const discBuf = device.createBuffer({ size: 96*16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const specPrm = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const specTex = device.createTexture({ size: [SPEC_N, SPEC_N], format: 'r32float',
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });
+  const imgTex  = device.createTexture({ size: [IMG_N, IMG_N], format: 'r32float',
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });
+
+  // specimen features: gold-on-carbon style particle field, deterministic
+  {
+    let s = 1234567;
+    const rnd = () => (s = (s*1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    const d = new Float32Array(96*4);
+    for (let i=0; i<96; i++) {
+      d[i*4]   = (rnd()*2-1)*38;                 // x µm
+      d[i*4+1] = (rnd()*2-1)*38;                 // y µm
+      d[i*4+2] = 0.15 + Math.pow(rnd(), 2.2)*6;  // radius µm, mostly small
+      d[i*4+3] = rnd();                          // tone
+    }
+    device.queue.writeBuffer(discBuf, 0, d);
+  }
+
+  // --- pipelines ---
+  const mk = code => device.createShaderModule({ code });
+  const flyPipe = device.createComputePipeline({ layout: 'auto',
+    compute: { module: mk(FLY), entryPoint: 'main' } });
+  const specPipe = device.createComputePipeline({ layout: 'auto',
+    compute: { module: mk(SPECIMEN), entryPoint: 'main' } });
+  const convPipe = device.createComputePipeline({ layout: 'auto',
+    compute: { module: mk(CONV), entryPoint: 'main' } });
+  const compPipe = device.createRenderPipeline({ layout: 'auto',
+    vertex: { module: mk(COMPOSITE), entryPoint: 'vs' },
+    fragment: { module: mk(COMPOSITE), entryPoint: 'fs', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' } });
+
+  // line pipeline: build vertex mapping with explicit canvas math
+  const linesSrc = /*wgsl*/`
+    struct Rects { col: vec4f, img: vec4f, psf: vec4f, focal: vec4f };
+    struct Canvas { size: vec2f, rScale: f32, zSpan: f32 };
+    @group(0) @binding(0) var<uniform> rc: Rects;
+    @group(0) @binding(1) var<storage, read> traj: array<vec2f>;
+    @group(0) @binding(2) var<uniform> cv: Canvas;
+    struct VOut { @builtin(position) pos: vec4f, @location(0) col: vec3f };
+    fn hsv(h: f32) -> vec3f {
+      let k = fract(vec3f(h, h + 2.0/3.0, h + 1.0/3.0)) * 6.0;
+      return clamp(abs(k - 3.0) - 1.0, vec3f(0.0), vec3f(1.0));
+    }
+    @vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+      let s = traj[ii*${TRAJ_PTS}u + vi];
+      let px = rc.col.x + rc.col.z * clamp(0.5 + s.y*cv.rScale, 0.02, 0.98);
+      let py = rc.col.y + rc.col.w * clamp(s.x/cv.zSpan, 0.0, 1.0);
+      var o: VOut;
+      o.pos = vec4f(px/cv.size.x*2.0 - 1.0, 1.0 - py/cv.size.y*2.0, 0.0, 1.0);
+      o.col = hsv(f32(ii % ${NTRAJ/2}u)/f32(${NTRAJ/2}) * 0.83);
+      return o;
+    }
+    @fragment fn fs(v: VOut) -> @location(0) vec4f { return vec4f(v.col, 1.0); }`;
+  const cvBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const linePipe = device.createRenderPipeline({ layout: 'auto',
+    vertex: { module: mk(linesSrc), entryPoint: 'vs' },
+    fragment: { module: mk(linesSrc), entryPoint: 'fs', targets: [{ format,
+      blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one' }, alpha: {} } }] },
+    primitive: { topology: 'line-strip' } });
+
+  // --- bind groups ---
+  const bgFly = device.createBindGroup({ layout: flyPipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: prmBuf } },
+    { binding: 1, resource: { buffer: histBuf } },
+    { binding: 2, resource: { buffer: trajBuf } },
+    { binding: 3, resource: { buffer: modeBuf } }] });
+  const bgSpec = device.createBindGroup({ layout: specPipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: specPrm } },
+    { binding: 1, resource: { buffer: discBuf } },
+    { binding: 2, resource: specTex.createView() }] });
+  const bgConv = device.createBindGroup({ layout: convPipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: kRBuf } },
+    { binding: 1, resource: { buffer: kernBuf } },
+    { binding: 2, resource: specTex.createView() },
+    { binding: 3, resource: imgTex.createView() }] });
+  const bgComp = device.createBindGroup({ layout: compPipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: prmBuf } },
+    { binding: 1, resource: { buffer: rectBuf } },
+    { binding: 2, resource: imgTex.createView() },
+    { binding: 3, resource: { buffer: histBuf } }] });
+  const bgLine = device.createBindGroup({ layout: linePipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: rectBuf } },
+    { binding: 1, resource: { buffer: trajBuf } },
+    { binding: 2, resource: { buffer: cvBuf } }] });
+
+  // --- layout ---
+  const R = { col: [0,0,0,0], img: [0,0,0,0], psf: [0,0,0,0] };
+  let zSpan = 0, rScale = 0, zCross = -1;
+  function layout() {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    const w = $('stage').clientWidth*dpr, h = $('stage').clientHeight*dpr;
+    canvas.width = ui.width = w; canvas.height = ui.height = h;
+    const pad = 14*dpr;
+    const imgS = Math.min(h - 2*pad, w*0.52);
+    R.img = [w - imgS - pad, (h - imgS)/2, imgS, imgS];
+    R.col = [pad, pad, R.img[0] - 2*pad, h - 2*pad];
+    const ps = Math.min(110*dpr, imgS*0.3);
+    R.psf = [R.img[0] - ps - 8*dpr, h - pad - ps, ps, ps];
+    device.queue.writeBuffer(rectBuf, 0, new Float32Array([
+      ...R.col, ...R.img, ...R.psf, zCross, rScale, 0, zSpan]));
+    device.queue.writeBuffer(cvBuf, 0, new Float32Array([w, h, rScale, zSpan]));
+    drawOverlay(dpr);
+  }
+  function drawOverlay(dpr) {
+    const c = uictx; c.clearRect(0, 0, ui.width, ui.height);
+    c.font = `${11*dpr}px Segoe UI, system-ui, sans-serif`;
+    c.fillStyle = '#7c6fae';
+    c.fillText('COLUMN  (r exaggerated)', R.col[0], R.col[1] + 12*dpr);
+    c.fillText('IMAGE', R.img[0], R.img[1] - 6*dpr);
+    c.fillText('PROBE (log)', R.psf[0], R.psf[1] - 5*dpr);
+    // lens coil marks at zL
+    const y = R.col[1] + R.col[3]*(ZL/zSpan);
+    c.fillStyle = '#b06cff';
+    for (const s of [-1, 1]) {
+      const x = R.col[0] + R.col[2]*(0.5 + s*0.44);
+      c.beginPath(); c.arc(x, y, 6*dpr, 0, 7); c.fill();
+    }
+    c.fillStyle = '#7c6fae';
+    c.fillText('lens', R.col[0] + R.col[2]*0.5 + 30*dpr, y + 4*dpr);
+    const ys = R.col[1] + R.col[3]*(P.zS/zSpan);
+    c.fillText('sample', R.col[0] + R.col[2]*0.5 + 30*dpr, ys - 6*dpr);
+    // FOV scale bar under image
+    const um = P.FOV*1e6, bar = R.img[2]/um * Math.pow(10, Math.floor(Math.log10(um/3)));
+    c.fillStyle = '#f4f0ff';
+    c.fillRect(R.img[0], R.img[1] + R.img[2] + 8*dpr, bar, 2*dpr);
+    c.fillText(`${Math.pow(10, Math.floor(Math.log10(um/3)))} \u00b5m`, R.img[0] + bar + 6*dpr, R.img[1] + R.img[2] + 13*dpr);
+  }
+
+  // --- simulation driver ---
+  let frame = 0, busy = false, dirty = true, dirtySpec = true;
+  function writePrm(extent) {
+    device.queue.writeBuffer(prmBuf, 0, new Float32Array([
+      P.B0, P.V, P.dE, P.srcR, P.alpha, P.zS, extent, Math.random()*1e6,
+      P.FOV, P.dose, frame, 0]));
+  }
+  async function recompute() {
+    if (busy) { dirty = true; return; }
+    busy = true; dirty = false;
+    // paraxial oracle -> crossover, magnification, extent prediction
+    const px = paraxial(P.B0, P.V, P.zS + 0.001);
+    zCross = px.zCross <= P.zS + 0.0005 ? px.zCross : -1;
+    zSpan = P.zS * 1.04;
+    const rEdge = px.rAtEnd * P.alpha;               // geometric edge-ray radius at sample
+    const Mag = isFinite(px.Mag) ? px.Mag : (P.zS - ZL)/ZL;
+    const spot = rEdge + Mag*P.srcR + 3e-8;
+    const extent = Math.min(Math.max(5*spot, 4e-7), 4e-3);
+    rScale = 0.46 / Math.max(P.alpha*ZL*2.2, rEdge*3, 2e-4);
+    writePrm(extent);
+    layout();
+    // clear histogram, fly batches, trajectories
+    device.queue.writeBuffer(histBuf, 0, new Uint32Array(HIST_N*HIST_N));
+    device.queue.writeBuffer(modeBuf, 0, new Uint32Array([0, 0, 0, 0]));
+    const enc = device.createCommandEncoder();
+    const p = enc.beginComputePass();
+    p.setPipeline(flyPipe); p.setBindGroup(0, bgFly);
+    p.dispatchWorkgroups(NTOTAL/64); p.end();
+    device.queue.submit([enc.finish()]);
+    // trajectories (separate submit so mode uniform is distinct)
+    device.queue.writeBuffer(modeBuf, 0, new Uint32Array([1, 0, 0, 0]));
+    const e2 = device.createCommandEncoder();
+    const tp = e2.beginComputePass();
+    tp.setPipeline(flyPipe); tp.setBindGroup(0, bgFly);
+    tp.dispatchWorkgroups(1); tp.end();
+    e2.copyBufferToBuffer(histBuf, 0, histStage, 0, HIST_N*HIST_N*4);
+    device.queue.submit([e2.finish()]);
+    // read back histogram -> kernel at image pitch
+    await histStage.mapAsync(GPUMapMode.READ);
+    const hist = new Uint32Array(histStage.getMappedRange().slice(0));
+    histStage.unmap();
+    let sum = 0, sx = 0, sy = 0, sr2 = 0, hits = 0;
+    for (let y = 0; y < HIST_N; y++) for (let x = 0; x < HIST_N; x++) {
+      const v = hist[y*HIST_N + x]; if (!v) continue;
+      sum += v; sx += v*x; sy += v*y; hits += v;
+    }
+    const cx = sum ? sx/sum : HIST_N/2, cy = sum ? sy/sum : HIST_N/2;
+    for (let y = 0; y < HIST_N; y++) for (let x = 0; x < HIST_N; x++) {
+      const v = hist[y*HIST_N + x]; if (!v) continue;
+      sr2 += v*((x-cx)**2 + (y-cy)**2);
+    }
+    const histPitch = extent/HIST_N;
+    const rmsR = sum ? Math.sqrt(sr2/sum)*histPitch : 0;   // metres
+    const imgPitch = P.FOV/IMG_N;
+    const kR = Math.min(KMAX, Math.max(0, Math.ceil((extent/2)/imgPitch) - 1));
+    const W = 2*kR + 1, kern = new Float32Array((2*KMAX+1)**2);
+    let ksum = 0;
+    for (let ky = -kR; ky <= kR; ky++) for (let kx = -kR; kx <= kR; kx++) {
+      const hx = cx + kx*imgPitch/histPitch, hy = cy + ky*imgPitch/histPitch;
+      const ix = Math.round(hx), iy = Math.round(hy);
+      let v = 0;
+      if (ix >= 0 && iy >= 0 && ix < HIST_N && iy < HIST_N) v = hist[iy*HIST_N + ix];
+      kern[(ky+kR)*W + (kx+kR)] = v; ksum += v;
+    }
+    if (ksum === 0) { kern[kR*W + kR] = 1; ksum = 1; }     // sub-pixel probe = delta
+    for (let i = 0; i < W*W; i++) kern[i] /= ksum;
+    device.queue.writeBuffer(kernBuf, 0, kern);
+    device.queue.writeBuffer(kRBuf, 0, new Uint32Array([kR, 0, 0, 0]));
+    // specimen (on FOV change) + convolution
+    const e3 = device.createCommandEncoder();
+    if (dirtySpec) {
+      device.queue.writeBuffer(specPrm, 0, new Float32Array([P.FOV, 0, 0, 0]));
+      const sp = e3.beginComputePass();
+      sp.setPipeline(specPipe); sp.setBindGroup(0, bgSpec);
+      sp.dispatchWorkgroups(SPEC_N/8, SPEC_N/8); sp.end();
+      dirtySpec = false;
+    }
+    const cp = e3.beginComputePass();
+    cp.setPipeline(convPipe); cp.setBindGroup(0, bgConv);
+    cp.dispatchWorkgroups(IMG_N/8, IMG_N/8); cp.end();
+    device.queue.submit([e3.finish()]);
+    // stats
+    const d = 2.355*rmsR; // FWHM-ish from rms
+    const focused = zCross > 0 && Math.abs(zCross - P.zS) < 0.4e-3;
+    $('stats').innerHTML =
+      `crossover&nbsp; <b>${zCross > 0 ? (zCross*1e3).toFixed(1)+' mm' : 'beyond sample'}</b>` +
+      (focused ? ' <span class="ok">&#9679; in focus</span>'
+               : ' <span class="off">&#9675; defocused</span>') +
+      `<br>demagnification&nbsp; <b>${isFinite(px.Mag) ? '1 / '+(1/px.Mag).toFixed(1) : '&mdash;'}</b>` +
+      `<br>probe diameter&nbsp; <b>${d > 1e-6 ? (d*1e6).toFixed(2)+' \u00b5m' : (d*1e9).toFixed(0)+' nm'}</b>` +
+      `<br>electrons landed&nbsp; <b>${hits.toLocaleString()}</b> / ${NTOTAL.toLocaleString()}` +
+      `<br><br>Paraxial theory predicts the crossover; the probe you see is ${(NTOTAL/1000)|0}k electrons flown through the full Lorentz force, so spherical + chromatic blur are real.`;
+    busy = false;
+    if (dirty) recompute();
+  }
+
+  // --- render loop ---
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function draw() {
+    frame++;
+    if (!reduced || frame === 1) {
+      device.queue.writeBuffer(prmBuf, 40, new Float32Array([frame]));
+    }
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginRenderPass({ colorAttachments: [{
+      view: ctx.getCurrentTexture().createView(),
+      loadOp: 'clear', storeOp: 'store', clearValue: { r: 0.102, g: 0.078, b: 0.188, a: 1 } }] });
+    pass.setPipeline(compPipe); pass.setBindGroup(0, bgComp); pass.draw(3);
+    pass.setPipeline(linePipe); pass.setBindGroup(0, bgLine);
+    pass.draw(TRAJ_PTS, NTRAJ);
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    requestAnimationFrame(draw);
+  }
+
+  // --- wiring ---
+  const onChange = specToo => () => { readSliders(); if (specToo) dirtySpec = true; recompute(); };
+  for (const id of ['sV','sB','sW','sA','sS','sE','sD']) $(id).addEventListener('input', onChange(false));
+  $('sF').addEventListener('input', onChange(true));
+  $('focusBtn').addEventListener('click', () => { autofocus(); onChange(false)(); });
+  addEventListener('resize', () => { layout(); });
+
+  readSliders();
+  autofocus(); readSliders();
+  layout();
+  await recompute();
+  $('overlay').classList.add('hidden');
+  draw();
+}
+boot().catch(e => { errBox.textContent = String(e && e.message || e); });
+</script>
+</body>
+</html>
