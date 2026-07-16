@@ -65,16 +65,18 @@
 <div id="panel">
   <h1>Beam Lab</h1>
   <div class="sub">single-lens SEM &middot; webgpu</div>
-  <div class="ctl"><label>Accelerating voltage <output id="oV">10.0 kV</output></label>
-    <input type="range" id="sV" min="1" max="30" step="0.1" value="10"></div>
+  <div class="ctl"><label>Accelerating voltage <output id="oV">5.0 kV</output></label>
+    <input type="range" id="sV" min="1" max="30" step="0.1" value="5"></div>
   <div class="ctl"><label>Lens field B&#8320; <output id="oB">42.0 mT</output></label>
     <input type="range" id="sB" min="0" max="120" step="0.02" value="42"></div>
   <div class="ctl"><label>Working distance <output id="oW">20 mm</output></label>
     <input type="range" id="sW" min="12" max="60" step="0.5" value="20"></div>
-  <div class="ctl"><label>Aperture semi-angle <output id="oA">4.0 mrad</output></label>
-    <input type="range" id="sA" min="0.5" max="15" step="0.1" value="4"></div>
-  <div class="ctl"><label>Source size (diam.) <output id="oS">2.0 &micro;m</output></label>
-    <input type="range" id="sS" min="0.1" max="20" step="0.1" value="2"></div>
+  <div class="ctl"><label>Final aperture &#8960; <output id="oA">200 &micro;m</output></label>
+    <input type="range" id="sA" min="25" max="500" step="5" value="200"></div>
+  <div class="ctl"><label>Aperture position <output id="oAz">105 mm</output></label>
+    <input type="range" id="sAz" min="30" max="128" step="1" value="105"></div>
+  <div class="ctl"><label>Source size (diam.) <output id="oS">30 &micro;m</output></label>
+    <input type="range" id="sS" min="0.5" max="50" step="0.5" value="30"></div>
   <div class="ctl"><label>Energy spread &Delta;E <output id="oE">1.5 eV</output></label>
     <input type="range" id="sE" min="0" max="10" step="0.1" value="1.5"></div>
   <div class="ctl"><label>Beam current (dose) <output id="oD">30 %</output></label>
@@ -110,16 +112,18 @@ function readSliders() {
   P.V   = +$('sV').value * 1e3;          // volts
   P.B0  = +$('sB').value * 1e-3;         // tesla
   P.WD  = +$('sW').value * 1e-3;         // m
-  P.alpha = +$('sA').value * 1e-3;       // rad
-  P.srcR  = +$('sS').value * 1e-6 / 2;   // radius, m
+  P.apR  = +$('sA').value * 1e-6 / 2;    // aperture radius, m
+  P.srcR = +$('sS').value * 1e-6 / 2;    // source radius, m
   P.dE  = +$('sE').value;                // eV
   P.dose = +$('sD').value;
   P.FOV = Math.pow(10, +$('sF').value) * 1e-6; // 2–80 µm, log slider
   P.zS  = ZL + P.WD;
+  P.apZ = Math.min(+$('sAz').value * 1e-3, P.zS - 0.003); // aperture must sit above sample
   $('oV').textContent = (P.V/1e3).toFixed(1)+' kV';
   $('oB').textContent = (P.B0*1e3).toFixed(2)+' mT';
   $('oW').textContent = (P.WD*1e3).toFixed(1)+' mm';
-  $('oA').textContent = (P.alpha*1e3).toFixed(1)+' mrad';
+  $('oA').textContent = (P.apR*2e6).toFixed(0)+' \u00b5m';
+  $('oAz').textContent = (P.apZ*1e3).toFixed(0)+' mm';
   $('oS').textContent = (P.srcR*2e6).toFixed(1)+' \u00b5m';
   $('oE').textContent = P.dE.toFixed(1)+' eV';
   $('oD').textContent = P.dose+' %';
@@ -129,11 +133,11 @@ function readSliders() {
 // ---------- paraxial oracle (CPU): r'' = -K(z) r,  K = eB(z)^2 / (8 m V_r) ----------
 function relV(V) { return V * (1 + QE*V/(2*ME*C*C)); }
 function Bz(z, B0) { const u = (z - ZL)/GA; return B0/(1 + u*u); }
-function paraxial(B0, V, zEnd) {
+function paraxial(B0, V, zEnd, zAp) {
   const Vr = relV(V), kc = QE/(8*ME*Vr);
   const dz = 2e-4, n = Math.ceil(zEnd/dz);
   // ray 1: point source, r=0, r'=1 ; ray 2: field ray, r=1, r'=0
-  let r1=0, s1=1, r2=1, s2=0, zCross = Infinity, Mag = NaN;
+  let r1=0, s1=1, r2=1, s2=0, zCross = Infinity, Mag = NaN, r1a = zAp, r2a = 1;
   for (let i=0; i<n; i++) {
     const z = i*dz;
     const step = (r,s) => { // RK4 on [r' = s, s' = -K r]
@@ -149,9 +153,11 @@ function paraxial(B0, V, zEnd) {
       zCross = z + dz * r1/(r1 - p1[0]);
       Mag = Math.abs(r2 + (p2[0]-r2) * (zCross-z)/dz);
     }
+    if (zAp !== undefined && z < zAp && z + dz >= zAp) { r1a = p1[0]; r2a = p2[0]; }
     r1=p1[0]; s1=p1[1]; r2=p2[0]; s2=p2[1];
   }
-  return { zCross, Mag, rAtEnd: Math.abs(r1) }; // rAtEnd per unit launch angle
+  // rAtEnd, sEnd: radius and slope at zEnd per unit launch angle; r1a/r2a: rays at aperture
+  return { zCross, Mag, rAtEnd: Math.abs(r1), sEnd: Math.abs(s1), r1a, r2a };
 }
 function autofocus() {
   let lo = 0.5e-3, hi = 200e-3; // zCross decreases as B0 grows
@@ -167,7 +173,8 @@ const COMMON = /*wgsl*/`
 struct Prm {
   B0:f32, V:f32, dE:f32, srcR:f32,
   alpha:f32, zS:f32, extent:f32, seed:f32,
-  fov:f32, dose:f32, time:f32, kR:f32,
+  fov:f32, dose:f32, time:f32, apR:f32,
+  apZ:f32, pad0:f32, pad1:f32, pad2:f32,
 };
 const ZL = ${ZL}; const GA = ${GA};
 const QE = ${QE}; const ME = ${ME}; const CC = ${C};
@@ -234,6 +241,16 @@ fn integrate(p0: vec3f, v0: vec3f, qm: f32, ti: u32) -> vec3f {
     let a4 = accel(p4, v4, prm.B0, qm);
     let pn = p + dt/6.0*(v + 2.0*v2 + 2.0*v3 + v4);
     let vn = v + dt/6.0*(a1 + 2.0*a2 + 2.0*a3 + a4);
+    if (p.z < prm.apZ && pn.z >= prm.apZ) {          // crossing the final aperture
+      let ta = (prm.apZ - p.z)/(pn.z - p.z);
+      let pa = mix(p, pn, ta);
+      if (length(pa.xy) > prm.apR) {                 // absorbed on the diaphragm
+        if (mode.x == 1u) {
+          for (; k < ${TRAJ_PTS}u; k++) { traj[ti*${TRAJ_PTS}u + k] = vec2f(pa.z, pa.x); }
+        }
+        return vec3f(1e9);
+      }
+    }
     if (pn.z >= prm.zS) {
       let t = (prm.zS - p.z)/(pn.z - p.z);
       p = mix(p, pn, t);
@@ -385,7 +402,7 @@ async function boot() {
   ctx.configure({ device, format, alphaMode: 'opaque' });
 
   // --- buffers / textures ---
-  const prmBuf  = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const prmBuf  = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const modeBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const rectBuf = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const histBuf = device.createBuffer({ size: HIST_N*HIST_N*4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
@@ -515,6 +532,15 @@ async function boot() {
     }
     c.fillStyle = '#7c6fae';
     c.fillText('lens', R.col[0] + R.col[2]*0.5 + 30*dpr, y + 4*dpr);
+    // final aperture: two bars with a gap of the true (exaggerated-r) opening
+    const ya = R.col[1] + R.col[3]*(P.apZ/zSpan);
+    const cxp = R.col[0] + R.col[2]*0.5;
+    const gap = Math.max(P.apR*rScale*R.col[2], 1.5*dpr);
+    c.fillStyle = '#ffd93d';
+    c.fillRect(R.col[0] + R.col[2]*0.06, ya - dpr, cxp - gap - (R.col[0] + R.col[2]*0.06), 2*dpr);
+    c.fillRect(cxp + gap, ya - dpr, R.col[0] + R.col[2]*0.94 - (cxp + gap), 2*dpr);
+    c.fillStyle = '#7c6fae';
+    c.fillText('aperture', R.col[0] + R.col[2]*0.5 + 30*dpr, ya + 14*dpr);
     const ys = R.col[1] + R.col[3]*(P.zS/zSpan);
     c.fillText('sample', R.col[0] + R.col[2]*0.5 + 30*dpr, ys - 6*dpr);
     // FOV scale bar under image
@@ -526,24 +552,29 @@ async function boot() {
 
   // --- simulation driver ---
   let frame = 0, busy = false, dirty = true, dirtySpec = true;
-  function writePrm(extent) {
+  function writePrm(extent, alphaL) {
     device.queue.writeBuffer(prmBuf, 0, new Float32Array([
-      P.B0, P.V, P.dE, P.srcR, P.alpha, P.zS, extent, Math.random()*1e6,
-      P.FOV, P.dose, frame, 0]));
+      P.B0, P.V, P.dE, P.srcR, alphaL, P.zS, extent, Math.random()*1e6,
+      P.FOV, P.dose, frame, P.apR, P.apZ, 0, 0, 0]));
   }
   async function recompute() {
     if (busy) { dirty = true; return; }
     busy = true; dirty = false;
-    // paraxial oracle -> crossover, magnification, extent prediction
-    const px = paraxial(P.B0, P.V, P.zS + 0.001);
+    // paraxial oracle -> crossover, magnification, aperture-defined angles
+    const px = paraxial(P.B0, P.V, P.zS + 0.001, P.apZ);
     zCross = px.zCross <= P.zS + 0.0005 ? px.zCross : -1;
     zSpan = P.zS * 1.04;
-    const rEdge = px.rAtEnd * P.alpha;               // geometric edge-ray radius at sample
+    const AMAX = 25e-3;
+    const r1a = Math.max(Math.abs(px.r1a), 1e-5);    // axial ray radius at aperture, per rad
+    const aGraze = Math.min(P.apR / r1a, AMAX);      // launch angle that grazes the aperture
+    const alphaL = Math.min(1.15*(P.apR + P.srcR*Math.abs(px.r2a))/r1a, AMAX); // overfill
+    const aSample = px.sEnd * aGraze;                // convergence semi-angle at the sample
+    const rEdge = px.rAtEnd * aGraze;                // geometric edge-ray radius at sample
     const Mag = isFinite(px.Mag) ? px.Mag : (P.zS - ZL)/ZL;
     const spot = rEdge + Mag*P.srcR + 3e-8;
     const extent = Math.min(Math.max(5*spot, 4e-7), 4e-3);
-    rScale = 0.46 / Math.max(P.alpha*ZL*2.2, rEdge*3, 2e-4);
-    writePrm(extent);
+    rScale = 0.46 / Math.max(alphaL*Math.min(P.apZ, ZL + GA), 3*rEdge, 3*P.apR, 2e-4);
+    writePrm(extent, alphaL);
     layout();
     // clear histogram, fly batches, trajectories
     device.queue.writeBuffer(histBuf, 0, new Uint32Array(HIST_N*HIST_N));
@@ -614,18 +645,20 @@ async function boot() {
     device.queue.submit([e3.finish()]);
     // stats
     const d = 2.355*rmsR; // FWHM-ish from rms
-    const alphaImg = isFinite(px.Mag) && px.Mag > 0 ? P.alpha/px.Mag : P.alpha;
     const floorR = Mag*P.srcR + 3e-8;
-    const dofT = Math.max(2*floorR/alphaImg, 1.5e-4);
+    const dofT = Math.max(2*floorR/Math.max(aSample, 1e-4), 1.5e-4);
     const focused = zCross > 0 && Math.abs(zCross - P.zS) < dofT;
+    const dof = d / Math.max(aSample, 1e-5);
     $('stats').innerHTML =
       `crossover&nbsp; <b>${zCross > 0 ? (zCross*1e3).toFixed(1)+' mm' : 'beyond sample'}</b>` +
       (focused ? ' <span class="ok">&#9679; in focus</span>'
                : ' <span class="off">&#9675; defocused</span>') +
       `<br>demagnification&nbsp; <b>${isFinite(px.Mag) ? '1 / '+(1/px.Mag).toFixed(1) : '&mdash;'}</b>` +
       `<br>probe diameter&nbsp; <b>${d > 1e-6 ? (d*1e6).toFixed(2)+' \u00b5m' : (d*1e9).toFixed(0)+' nm'}</b>` +
-      `<br>electrons landed&nbsp; <b>${hits.toLocaleString()}</b> / ${NTOTAL.toLocaleString()}` +
-      `<br><br>Paraxial theory predicts the crossover; the probe you see is ${(NTOTAL/1000)|0}k electrons flown through the full Lorentz force, so spherical + chromatic blur are real.`;
+      `<br>&alpha; at sample&nbsp; <b>${(aSample*1e3).toFixed(2)} mrad</b>` +
+      `<br>depth of field&nbsp; <b>${dof > 1e-3 ? (dof*1e3).toFixed(2)+' mm' : (dof*1e6).toFixed(0)+' \u00b5m'}</b>` +
+      `<br>through aperture&nbsp; <b>${(100*hits/NTOTAL).toFixed(0)} %</b> of ${(NTOTAL/1000)|0}k flown` +
+      `<br><br>The launch cone overfills the aperture; electrons are absorbed on the diaphragm in-flight, so the aperture truly defines &alpha;, current, and depth of field.`;
     busy = false;
     if (dirty) recompute();
   }
@@ -651,7 +684,7 @@ async function boot() {
 
   // --- wiring ---
   const onChange = specToo => () => { readSliders(); if (specToo) dirtySpec = true; recompute(); };
-  for (const id of ['sV','sB','sW','sA','sS','sE','sD']) $(id).addEventListener('input', onChange(false));
+  for (const id of ['sV','sB','sW','sA','sAz','sS','sE','sD']) $(id).addEventListener('input', onChange(false));
   $('sF').addEventListener('input', onChange(true));
   $('focusBtn').addEventListener('click', () => { autofocus(); onChange(false)(); });
   addEventListener('resize', () => { layout(); });
